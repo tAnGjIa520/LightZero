@@ -13,17 +13,35 @@ from ding.utils import set_pkg_seed, get_rank, get_world_size
 from ding.worker import BaseLearner
 from tensorboardX import SummaryWriter
 
-from lzero.entry.utils import log_buffer_memory_usage, TemperatureScheduler
+# 添加性能监控相关导入
+try:
+    from line_profiler import LineProfiler
+except ImportError:
+    LineProfiler = None
+
+from lzero.entry.utils import (
+    log_buffer_memory_usage, TemperatureScheduler,
+    collect_and_log_moe_statistics, collect_and_log_divergences_with_heatmaps
+)
 from lzero.policy import visit_count_temperature
 from lzero.worker import MuZeroEvaluator as Evaluator
 from lzero.worker import MuZeroSegmentCollector as Collector
 from ding.utils import EasyTimer
 import torch.nn.functional as F
-
+import sys
+import os
+PROJECT_ROOT = os.path.abspath("/fs-computility/niuyazhe/tangjia/github/LightZero") # 或者直接写死路径
+sys.path.insert(0, PROJECT_ROOT)
 import torch.distributed as dist
-
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+import matplotlib.pyplot as plt
+import seaborn as sns
+from io import BytesIO
+from PIL import Image
+# tb_logger = None
 # ------------------------------------------------------------
-# 1. 额外增加 learner 专用 process-group
+# 1. 额外增加 learner 专用 process-group 
 #    (在 main / learner 初始化时调用一次)
 # ------------------------------------------------------------
 def build_learner_group(learner_ranks: list[int]) -> dist.ProcessGroup:
@@ -37,8 +55,788 @@ def build_learner_group(learner_ranks: list[int]) -> dist.ProcessGroup:
     if dist.get_rank() in learner_ranks:
         torch.cuda.set_device(learner_ranks.index(dist.get_rank()))
     return pg
+
+
+# ------------------------------------------------------------
+# MOE专家选择统计相关函数
+# ------------------------------------------------------------
+def merge_expert_stats_across_ranks(all_expert_stats):
+    """合并所有rank的专家选择统计数据"""
+    merged_stats = {}  # {task_id: {window_type: stats}}
     
+    for rank_expert_stats in all_expert_stats:
+        if rank_expert_stats:
+            for task_id, task_stats in rank_expert_stats.items():
+                if task_id not in merged_stats:
+                    merged_stats[task_id] = {}
+                
+                for window_type, stats in task_stats.items():
+                    # 只处理有实际数据的统计（当前GPU负责的任务）
+                    if stats and stats.get('total_selections', 0) > 0:
+                        merged_stats[task_id][window_type] = {
+                            'frequencies': np.array(stats['frequencies']),
+                            'total_selections': stats['total_selections'],
+                            'data_points': stats['data_points']
+                        }
+    return merged_stats
+
+
+# 全局图像缓存，避免重复创建 figure
+_GLOBAL_HEATMAP_FIG = None
+_GLOBAL_HEATMAP_AX = None
+
+def _get_or_create_heatmap_figure(figsize):
+    """获取或创建复用的 heatmap figure"""
+    global _GLOBAL_HEATMAP_FIG, _GLOBAL_HEATMAP_AX
+    if _GLOBAL_HEATMAP_FIG is None:
+        _GLOBAL_HEATMAP_FIG, _GLOBAL_HEATMAP_AX = plt.subplots(figsize=figsize)
+    else:
+        # 清除之前的内容
+        _GLOBAL_HEATMAP_AX.clear()
+        # 调整图像大小
+        _GLOBAL_HEATMAP_FIG.set_size_inches(figsize)
+    return _GLOBAL_HEATMAP_FIG, _GLOBAL_HEATMAP_AX
+
+def create_heatmap_with_values_fast(matrix, task_ids, title="Task-Expert Selection Frequencies"):
+    """
+    高效创建带数值标注的蓝色系热力图 - 优化版本
+    
+    优化点:
+    1. 复用 matplotlib figure，减少内存分配
+    2. 大矩阵跳过数值标注，避免性能损失
+    3. 优化图像转换流程
+    4. 使用更低的 DPI 减少计算量
+    """
+    try:
+        figsize = (max(6, matrix.shape[1]), max(4, matrix.shape[0]))
+        fig, ax = _get_or_create_heatmap_figure(figsize)
+        
+        # 智能选择是否显示数值标注
+        show_annot = matrix.size <= 64  # 只在 8x8 或更小时显示数值
+        
+        # 使用 matplotlib 直接绘制，避免 seaborn 的额外开销
+        im = ax.imshow(matrix, cmap='Blues', aspect='auto')
+        
+        # 有选择性地添加数值标注
+        if show_annot:
+            for i in range(matrix.shape[0]):
+                for j in range(matrix.shape[1]):
+                    value = matrix[i, j]
+                    color = 'white' if value > 0.5 else 'black'
+                    ax.text(j, i, f'{value:.3f}', ha='center', va='center', 
+                           color=color, fontsize=8)
+        
+        # 设置标签和标题
+        ax.set_xticks(range(matrix.shape[1]))
+        ax.set_yticks(range(matrix.shape[0]))
+        ax.set_xticklabels([f'E{i}' for i in range(matrix.shape[1])], fontsize=10)
+        ax.set_yticklabels([f'T{tid}' for tid in task_ids], fontsize=10)
+        ax.set_title(title, fontsize=12, pad=15)
+        ax.set_xlabel('Experts', fontsize=10)
+        ax.set_ylabel('Tasks', fontsize=10)
+        
+        # 简化的 colorbar
+        if not hasattr(fig, '_colorbar_created'):
+            plt.colorbar(im, ax=ax, label='Frequency')
+            fig._colorbar_created = True
+        
+        # 优化的图像转换：使用更低 DPI 和简化流程
+        fig.canvas.draw()
+        try:
+            # 直接从 canvas 获取 RGB 数据
+            if hasattr(fig.canvas, 'buffer_rgba'):
+                buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+                buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+                img_array = buf[:, :, :3]  # 去掉 alpha 通道
+            else:
+                buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                img_array = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            
+            # 转换为 CHW 格式
+            img_array = img_array.transpose(2, 0, 1)
+            
+        except Exception:
+            # 回退方案：创建简单的蓝色渠度矩阵
+            h, w = matrix.shape
+            img_array = np.zeros((3, h*20, w*20), dtype=np.uint8)
+            # 简单放大矩阵并映射到蓝色通道
+            matrix_resized = np.repeat(np.repeat(matrix, 20, axis=0), 20, axis=1)
+            img_array[2] = (matrix_resized * 255).astype(np.uint8)
+        
+        return img_array
+        
+    except Exception as e:
+        print(f"Warning: 热力图生成失败: {e}, 使用回退方案")
+        # 终极回退：返回空白图像
+        return np.zeros((3, 100, 100), dtype=np.uint8)
+
+# 保留原始函数作为回退
+def create_heatmap_with_values(matrix, task_ids, title="Task-Expert Selection Frequencies"):
+    """创建带数值标注的蓝色系热力图 - 原始版本（回退用）"""
+    fig, ax = plt.subplots(figsize=(max(8, matrix.shape[1]), max(6, matrix.shape[0])))
+    
+    # 使用蓝色系颜色映射
+    sns.heatmap(matrix, 
+                annot=True,  # 显示数值
+                fmt='.3f',   # 数值格式
+                cmap='Blues',  # 蓝色系
+                ax=ax,
+                cbar_kws={'label': 'Selection Frequency'},
+                xticklabels=[f'Expert{i}' for i in range(matrix.shape[1])],
+                yticklabels=[f'Task{tid}' for tid in task_ids])
+    
+    ax.set_title(title, fontsize=14, pad=20)
+    ax.set_xlabel('Experts', fontsize=12)
+    ax.set_ylabel('Tasks', fontsize=12)
+    
+    plt.tight_layout()
+    
+    # 保存到BytesIO
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    
+    # 转换为numpy数组用于tensorboard
+    img = Image.open(buf)
+    img_array = np.array(img)
+    buf.close()
+    plt.close(fig)
+    
+    # 转换为CHW格式 (Channel, Height, Width)
+    if len(img_array.shape) == 3:
+        img_array = img_array.transpose(2, 0, 1)
+    
+    return img_array
+
+
+def log_expert_selection_details(tb_logger, merged_stats, valid_task_ids, matrix, window_type, train_iter):
+    """记录每个任务的详细专家选择统计"""
+    for i, task_id in enumerate(valid_task_ids):
+        frequencies = matrix[i]
+        stats = merged_stats[task_id][window_type]
+        
+        # 记录每个专家的选择频率
+        # for expert_id, freq in enumerate(frequencies):
+        #     tb_logger.add_scalar(
+        #         f'MOE_Details/Task{task_id}_{window_type}/Expert{expert_id}_Frequency',
+        #         float(freq), global_step=train_iter
+        #     )
+        
+        # 计算并记录该任务选择专家的熵（均匀性指标）
+        task_frequencies = np.array(frequencies)
+        task_frequencies = task_frequencies + 1e-8  # 避免log(0)
+        task_entropy = -np.sum(task_frequencies * np.log(task_frequencies))
+        tb_logger.add_scalar(
+            f'MOE_Details/Task{task_id}_{window_type}/ExpertSelectionEntropy',
+            task_entropy, global_step=train_iter
+        )
+        
+        # 记录该任务专家选择的方差（分散程度）
+        expert_variance = np.var(task_frequencies)
+        tb_logger.add_scalar(
+            f'MOE_Details/Task{task_id}_{window_type}/ExpertSelectionVariance',
+            expert_variance, global_step=train_iter
+        )
+        
+        # 记录任务级别的汇总统计
+        tb_logger.add_scalar(
+            f'MOE_Details/Task{task_id}_{window_type}/TotalSelections',
+            stats['total_selections'], global_step=train_iter
+        )
+        tb_logger.add_scalar(
+            f'MOE_Details/Task{task_id}_{window_type}/DataPoints',
+            stats['data_points'], global_step=train_iter
+        )
+
+
+def log_global_moe_statistics(tb_logger, matrix, window_type, valid_task_ids, train_iter):
+    """记录全局MOE统计信息"""
+    # 记录基本信息
+    tb_logger.add_scalar(
+        f'MOE_Global/{window_type}/NumActiveTasks',
+        len(valid_task_ids), global_step=train_iter
+    )
+    tb_logger.add_scalar(
+        f'MOE_Global/{window_type}/NumExperts', 
+        matrix.shape[1], global_step=train_iter
+    )
+    
+    # 计算专家使用均匀性
+    expert_avg_usage = np.mean(matrix, axis=0)  # 每个专家的平均使用频率
+    usage_entropy = -np.sum(expert_avg_usage * np.log(expert_avg_usage + 1e-8))
+    tb_logger.add_scalar(
+        f'MOE_Global/{window_type}/ExpertUsageEntropy',
+        usage_entropy, global_step=train_iter
+    )
+    
+    # 记录最常用和最少用的专家
+    most_used_expert = np.argmax(expert_avg_usage)
+    least_used_expert = np.argmin(expert_avg_usage)
+    tb_logger.add_scalar(
+        f'MOE_Global/{window_type}/MostUsedExpert',
+        most_used_expert, global_step=train_iter
+    )
+    tb_logger.add_scalar(
+        f'MOE_Global/{window_type}/LeastUsedExpert', 
+        least_used_expert, global_step=train_iter
+    )
+
+
+def process_and_log_moe_heatmaps_fast(tb_logger, merged_stats, window_type, train_iter):
+    """
+    高效处理和记录MOE热力图 - 优化版本
+    
+    优化点:
+    1. 向量化数据处理，减少循环
+    2. 使用高效的热力图生成函数
+    3. 条件性热力图生成
+    4. 批量处理统计数据
+    """
+    # 快速筛选有效任务
+    valid_task_data = [(tid, stats[window_type]['frequencies']) 
+                      for tid, stats in merged_stats.items() 
+                      if window_type in stats]
+    
+    if not valid_task_data:
+        return
+    
+    # 向量化构建矩阵
+    valid_task_ids, frequencies_list = zip(*valid_task_data)
+    matrix = np.array(frequencies_list)
+    
+    # 条件性热力图生成：小矩阵才生成热力图
+    if matrix.size <= 200:  # 只有在任务数*专家数 <= 200时才生成热力图
+        try:
+            heatmap_img = create_heatmap_with_values_fast(
+                matrix, valid_task_ids, 
+                f'MOE {window_type} Task-Expert Selection'
+            )
+            
+            # 记录热力图到tensorboard
+            tb_logger.add_image(
+                f'MOE_Heatmap/{window_type}_TaskExpert_Heatmap',
+                heatmap_img,
+                global_step=train_iter,
+                dataformats='CHW'
+            )
+        except Exception as e:
+            print(f"Warning: 热力图生成失败: {e}")
+    
+    # 始终记录统计数据（轻量级操作）
+    log_expert_selection_details(tb_logger, merged_stats, valid_task_ids, matrix, window_type, train_iter)
+    log_global_moe_statistics(tb_logger, matrix, window_type, valid_task_ids, train_iter)
+
+# 保留原始函数作为回退
+def process_and_log_moe_heatmaps(tb_logger, merged_stats, window_type, train_iter):
+    """处理和记录MOE热力图 - 原始版本（回退用）"""
+    all_task_ids = sorted(merged_stats.keys())
+    task_expert_matrix = []
+    valid_task_ids = []
+    
+    # 收集有效任务的频率数据
+    for task_id in all_task_ids:
+        if window_type in merged_stats[task_id]:
+            frequencies = merged_stats[task_id][window_type]['frequencies']
+            task_expert_matrix.append(frequencies)
+            valid_task_ids.append(task_id)
+    
+    if not task_expert_matrix:
+        return
+    
+    # 转换为numpy矩阵 (num_tasks, num_experts)
+    matrix = np.array(task_expert_matrix)
+    
+    # 创建带数值标注的蓝色系热力图
+    heatmap_img = create_heatmap_with_values(
+        matrix, valid_task_ids, 
+        f'MOE {window_type} Task-Expert Selection Frequencies'
+    )
+    
+    # 记录热力图到tensorboard
+    tb_logger.add_image(
+        f'MOE_Heatmap/{window_type}_TaskExpert_Heatmap',
+        heatmap_img,
+        global_step=train_iter,
+        dataformats='CHW'
+    )
+    
+    # 记录详细统计和全局统计
+    log_expert_selection_details(tb_logger, merged_stats, valid_task_ids, matrix, window_type, train_iter)
+
+
+def convert_stats_to_serializable(moe_stats):
+    """将MOE统计数据中的tensor转换为可序列化的numpy格式"""
+    if not moe_stats:
+        return {}
+    
+    converted = {}
+    for task_id, task_stats in moe_stats.items():
+        converted[task_id] = {}
+        for window_type, stats in task_stats.items():
+            if stats and 'frequencies' in stats:
+                converted[task_id][window_type] = {
+                    'frequencies': stats['frequencies'].cpu().numpy().tolist(),
+                    'total_selections': stats['total_selections'],
+                    'data_points': stats['data_points']
+                }
+    return converted
+
+
+def gather_distributed_moe_stats(local_stats, world_size):
+    """分布式环境下汇总所有GPU的MOE统计数据"""
+    all_stats = [None for _ in range(world_size)]
+    try:
+        dist.all_gather_object(all_stats, local_stats)
+        return all_stats
+    except Exception as e:
+        print(f"分布式MOE统计汇总失败: {e}")
+        return [local_stats]  # fallback到本地统计
+
+
+def collect_and_log_moe_statistics(policy, tb_logger, train_iter, world_size, rank):
+    """
+    收集并记录MOE专家选择统计信息，包括热力图和分布分析
+    
+    Args:
+        policy: 训练策略对象，包含世界模型
+        tb_logger: TensorBoard日志记录器
+        train_iter: 当前训练迭代次数
+        world_size: 分布式训练的总GPU数量
+        rank: 当前GPU的rank
+    """
+    try:
+        # Step 1: 从policy的transformer模型中获取MOE统计
+        moe_stats = None
+        
+        transformer = policy._model.world_model.transformer
+        if hasattr(transformer, 'get_expert_selection_stats'):
+            moe_stats = transformer.get_expert_selection_stats()
+        
+        if moe_stats is None:
+            print(f"Rank {rank}: 警告: 无法获取MOE统计数据，train_iter={train_iter}")
+            return
+        
+        # Step 2: 转换tensor数据为可序列化格式
+        serializable_stats = convert_stats_to_serializable(moe_stats)
+        
+        print(f"Rank {rank}: 本地MOE统计 - 任务数: {len(serializable_stats)}, train_iter={train_iter}")
+        
+        # Step 3: 分布式汇总所有GPU的统计数据
+        all_expert_stats = gather_distributed_moe_stats(serializable_stats, world_size)
+        
+        # Step 4: 合并统计数据
+        merged_stats = merge_expert_stats_across_ranks(all_expert_stats)
+        
+        if not merged_stats:
+            print(f"Rank {rank}: 警告: 合并后的MOE统计为空，train_iter={train_iter}")
+            return
+        
+        # Step 5: 所有GPU都记录MOE统计，每个GPU记录自己的日志
+        print(f"Rank {rank}: 开始记录MOE统计 - 合并任务数: {len(merged_stats)}, train_iter={train_iter}")
+        
+        # 为每个时间窗口生成热力图和统计
+        for window_type in ['immediate', 'short', 'medium', 'long']:
+            if any(window_type in task_stats for task_stats in merged_stats.values()):
+                process_and_log_moe_heatmaps_fast(tb_logger, merged_stats, window_type, train_iter)
+        
+        # 记录总体MOE使用情况
+        tb_logger.add_scalar('MOE_Global/ActiveTasks', len(merged_stats), global_step=train_iter)
+        
+        # Step 6: 新增分布差异计算和记录（包含去对角线热力图）
+        if any('immediate' in task_stats for task_stats in merged_stats.values()):
+            print(f"Rank {rank}: 开始计算任务间分布差异...")
+            collect_and_log_divergences_with_heatmaps(tb_logger, merged_stats, train_iter)
+        
+        print(f"Rank {rank}: MOE统计记录完成，train_iter={train_iter}")
+    
+    except Exception as e:
+        print(f"Rank {rank}: MOE统计收集失败 - {e}, train_iter={train_iter}")
+        import traceback
+        traceback.print_exc()
+
 import concurrent.futures
+
+# ====== GPU优化的分布差异计算和可视化函数 ======
+def jensen_shannon_divergence_batch_gpu(distributions_tensor):
+    """
+    GPU批量计算JS散度矩阵 - 完全向量化，无循环
+    
+    Args:
+        distributions_tensor: shape (n_tasks, n_experts), GPU张量
+    
+    Returns:
+        js_matrix: shape (n_tasks, n_tasks), 对称矩阵
+    """
+    device = distributions_tensor.device
+    n_tasks, n_experts = distributions_tensor.shape
+    
+    # 1. 归一化为概率分布
+    eps = 1e-8
+    distributions_tensor = distributions_tensor / (distributions_tensor.sum(dim=1, keepdim=True) + eps)
+    
+    # 2. 使用广播计算所有任务对的平均分布
+    # P_i: (n_tasks, 1, n_experts), P_j: (1, n_tasks, n_experts)
+    P_i = distributions_tensor.unsqueeze(1)  
+    P_j = distributions_tensor.unsqueeze(0)  
+    M = 0.5 * (P_i + P_j)  # shape: (n_tasks, n_tasks, n_experts)
+    
+    # 3. 批量计算KL散度 - 完全向量化
+    # KL(P_i || M) for all pairs
+    log_ratio_i = torch.log((P_i + eps) / (M + eps))
+    kl_i_m = torch.sum(P_i * log_ratio_i, dim=2)  # (n_tasks, n_tasks)
+    
+    # KL(P_j || M) for all pairs  
+    log_ratio_j = torch.log((P_j + eps) / (M + eps))
+    kl_j_m = torch.sum(P_j * log_ratio_j, dim=2)  # (n_tasks, n_tasks)
+    
+    # 4. JS散度矩阵
+    js_matrix = 0.5 * (kl_i_m + kl_j_m)
+    
+    return js_matrix
+
+
+def wasserstein_distance_batch_gpu(distributions_tensor):
+    """
+    GPU批量计算Wasserstein距离矩阵 - 1D分布的高效实现
+    
+    Args:
+        distributions_tensor: shape (n_tasks, n_experts), GPU张量
+    
+    Returns:
+        wasserstein_matrix: shape (n_tasks, n_tasks), 对称矩阵
+    """
+    device = distributions_tensor.device
+    n_tasks, n_experts = distributions_tensor.shape
+    eps = 1e-8
+    
+    # 1. 归一化为概率分布
+    distributions_tensor = distributions_tensor / (distributions_tensor.sum(dim=1, keepdim=True) + eps)
+    
+    # 2. 计算累积分布函数 (CDF)
+    cdf_tensor = torch.cumsum(distributions_tensor, dim=1)  # (n_tasks, n_experts)
+    
+    # 3. 使用广播计算所有CDF对之间的L1距离
+    cdf_i = cdf_tensor.unsqueeze(1)  # (n_tasks, 1, n_experts)
+    cdf_j = cdf_tensor.unsqueeze(0)  # (1, n_tasks, n_experts)
+    
+    # Wasserstein距离 = 累积分布差异的L1范数
+    wasserstein_matrix = torch.sum(torch.abs(cdf_i - cdf_j), dim=2)
+    
+    return wasserstein_matrix
+
+
+def compute_distribution_divergences_optimized(merged_stats, window_type='immediate'):
+    """
+    GPU优化版本 - 高效分布差异计算
+    """
+    # 1. 数据预处理
+    valid_tasks = [(tid, stats[window_type]['frequencies']) 
+                  for tid, stats in merged_stats.items() 
+                  if window_type in stats]
+    
+    if len(valid_tasks) < 2:
+        return {}
+    
+    task_ids, frequencies_list = zip(*valid_tasks)
+    
+    # 2. 高效张量转换
+    try:
+        if isinstance(frequencies_list[0], torch.Tensor):
+            frequencies_tensor = torch.stack(frequencies_list)
+        else:
+            frequencies_tensor = torch.tensor(
+                np.array(frequencies_list), 
+                dtype=torch.float32
+            )
+        
+        # 自动GPU加速
+        if torch.cuda.is_available():
+            frequencies_tensor = frequencies_tensor.cuda()
+            
+    except Exception as e:
+        print(f"GPU转换失败，使用CPU: {e}")
+        frequencies_tensor = torch.tensor(np.array(frequencies_list), dtype=torch.float32)
+    
+    device = frequencies_tensor.device
+    n_tasks, n_experts = frequencies_tensor.shape
+    
+    # 3. GPU批量计算（无循环）
+    with torch.no_grad():
+        # 批量计算JS散度和Wasserstein距离
+        js_matrix = jensen_shannon_divergence_batch_gpu(frequencies_tensor)
+        wasserstein_matrix = wasserstein_distance_batch_gpu(frequencies_tensor)
+        
+        # 高效提取上三角值（避免重复计算）
+        triu_indices = torch.triu_indices(n_tasks, n_tasks, offset=1, device=device)
+        js_values = js_matrix[triu_indices[0], triu_indices[1]]
+        wasserstein_values = wasserstein_matrix[triu_indices[0], triu_indices[1]]
+        
+        # 统计计算（向量化）
+        js_stats = {
+            'avg': torch.mean(js_values).item(),
+            'max': torch.max(js_values).item(),
+            'min': torch.min(js_values).item(),
+            'std': torch.std(js_values).item()
+        }
+        
+        wasserstein_stats = {
+            'avg': torch.mean(wasserstein_values).item(),
+            'max': torch.max(wasserstein_values).item(), 
+            'min': torch.min(wasserstein_values).item(),
+            'std': torch.std(wasserstein_values).item()
+        }
+    
+    return {
+        'task_ids': task_ids,
+        'n_tasks': n_tasks,
+        'n_experts': n_experts,
+        'device': str(device),
+        'gpu_accelerated': 'cuda' in str(device),
+        
+        # 返回CPU版本用于记录
+        'js_matrix': js_matrix.cpu().numpy(),
+        'wasserstein_matrix': wasserstein_matrix.cpu().numpy(),
+        'js_stats': js_stats,
+        'wasserstein_stats': wasserstein_stats
+    }
+
+
+def create_similarity_heatmap_no_diagonal(similarity_matrix, task_ids, metric_name, title_suffix=""):
+    """
+    创建任务相似度热力图 - 去掉对角线部分
+    
+    Args:
+        similarity_matrix: 相似度矩阵 (n_tasks, n_tasks)
+        task_ids: 任务ID列表
+        metric_name: 指标名称 ('js_divergence', 'wasserstein_distance')
+        title_suffix: 标题后缀
+    """
+    try:
+        # 复制矩阵避免修改原数据
+        matrix = similarity_matrix.copy()
+        
+        # 将对角线设置为NaN，这样matplotlib会显示为空白
+        np.fill_diagonal(matrix, np.nan)
+        
+        figsize = (max(6, len(task_ids)), max(4, len(task_ids)))
+        fig, ax = plt.subplots(figsize=figsize)  # 创建新figure避免复用问题
+        
+        # 根据指标类型选择颜色映射
+        if 'js' in metric_name.lower():
+            cmap = 'Reds'
+            title_name = 'JS Divergence'
+            vmin, vmax = 0, 1.0
+        else:  # wasserstein
+            cmap = 'Blues'  
+            title_name = 'Wasserstein Distance'
+            vmin, vmax = None, None  # 自适应
+        
+        # 使用masked数组处理NaN值，对角线显示为白色
+        masked_matrix = np.ma.masked_invalid(matrix)
+        im = ax.imshow(masked_matrix, cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
+        
+        # 添加数值标注（跳过对角线）
+        if len(task_ids) <= 15:  # 只在任务数较少时添加标注
+            for i in range(len(task_ids)):
+                for j in range(len(task_ids)):
+                    if i != j:  # 跳过对角线
+                        value = matrix[i, j]
+                        if not np.isnan(value):
+                            threshold = (vmax or np.nanmax(matrix)) * 0.5 if vmax else np.nanmax(matrix) * 0.5
+                            color = 'white' if value > threshold else 'black'
+                            ax.text(j, i, f'{value:.3f}', ha='center', va='center', 
+                                   color=color, fontsize=8)
+        
+        # 设置标签
+        ax.set_xticks(range(len(task_ids)))
+        ax.set_yticks(range(len(task_ids)))
+        ax.set_xticklabels([f'T{tid}' for tid in task_ids], fontsize=9)
+        ax.set_yticklabels([f'T{tid}' for tid in task_ids], fontsize=9)
+        ax.set_title(f'Task {title_name} Matrix {title_suffix} (No Diagonal)', fontsize=12)
+        ax.set_xlabel('Tasks', fontsize=10)
+        ax.set_ylabel('Tasks', fontsize=10)
+        
+        # 添加colorbar
+        plt.colorbar(im, ax=ax, label=title_name, shrink=0.8)
+        
+        # 转换为图像数组 - 修复matplotlib版本兼容性
+        fig.canvas.draw()
+        
+        try:
+            # 新版matplotlib使用buffer_rgba
+            if hasattr(fig.canvas, 'buffer_rgba'):
+                buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+                h, w = fig.canvas.get_width_height()
+                img_array = buf.reshape(h, w, 4)[:, :, :3]  # 去掉alpha通道
+            else:
+                # 旧版matplotlib回退方案
+                buf = fig.canvas.print_to_string()
+                img_array = np.frombuffer(buf, dtype=np.uint8)
+                h, w = fig.canvas.get_width_height()
+                img_array = img_array.reshape(h, w, 3)
+        except Exception as conv_e:
+            print(f"图像转换方法失败: {conv_e}, 尝试PIL方案")
+            # 最终回退：通过PIL转换
+            from io import BytesIO
+            buf = BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            from PIL import Image
+            img = Image.open(buf)
+            img_array = np.array(img)[:, :, :3]  # 去掉alpha通道
+            buf.close()
+        
+        img_array = img_array.transpose(2, 0, 1)  # CHW格式
+        plt.close(fig)  # 关闭figure避免内存泄漏
+        
+        return img_array
+        
+    except Exception as e:
+        print(f"Warning: 无对角线热力图生成失败: {e}")
+        return np.zeros((3, 100, 100), dtype=np.uint8)
+
+
+def log_pairwise_optimized(tb_logger, divergence_data, train_iter):
+    """
+    优化的任务对记录 - 批量处理
+    """
+    task_ids = divergence_data['task_ids']
+    js_matrix = divergence_data['js_matrix']
+    wasserstein_matrix = divergence_data['wasserstein_matrix']
+    
+    # 批量构建任务对指标字典
+    pairwise_scalars = {}
+    
+    for i, task_i in enumerate(task_ids):
+        for j, task_j in enumerate(task_ids):
+            if i < j:  # 只记录上三角
+                # 构建指标名称
+                js_key = f'TaskPairwise/Immediate_Task{task_i}_Task{task_j}_JS_Divergence'
+                wass_key = f'TaskPairwise/Immediate_Task{task_i}_Task{task_j}_Wasserstein_Distance'
+                
+                pairwise_scalars[js_key] = js_matrix[i, j]
+                pairwise_scalars[wass_key] = wasserstein_matrix[i, j]
+    
+    # 批量写入TensorBoard
+    for key, value in pairwise_scalars.items():
+        tb_logger.add_scalar(key, float(value), global_step=train_iter)
+
+
+def log_divergences_with_heatmaps(tb_logger, divergence_data, train_iter):
+    """
+    记录分布差异指标和热力图（去掉对角线）
+    """
+    if not divergence_data:
+        return
+    
+    js_stats = divergence_data['js_stats']
+    wasserstein_stats = divergence_data['wasserstein_stats']
+    task_ids = divergence_data['task_ids']
+    n_tasks = divergence_data['n_tasks']
+    
+    # 调试：检查矩阵数据
+    js_matrix = divergence_data['js_matrix']
+    wasserstein_matrix = divergence_data['wasserstein_matrix']
+    print(f"DEBUG: JS矩阵形状={js_matrix.shape}, 范围=[{np.min(js_matrix):.6f}, {np.max(js_matrix):.6f}]")
+    print(f"DEBUG: Wasserstein矩阵形状={wasserstein_matrix.shape}, 范围=[{np.min(wasserstein_matrix):.6f}, {np.max(wasserstein_matrix):.6f}]")
+    
+    # 1. 记录标量指标
+    scalar_dict = {
+        'MOE_Divergence/Immediate_AvgJS_Divergence': js_stats['avg'],
+        'MOE_Divergence/Immediate_MaxJS_Divergence': js_stats['max'],
+        'MOE_Divergence/Immediate_AvgWasserstein_Distance': wasserstein_stats['avg'],
+        'MOE_Divergence/Immediate_MaxWasserstein_Distance': wasserstein_stats['max'],
+    }
+    
+    for key, value in scalar_dict.items():
+        tb_logger.add_scalar(key, value, global_step=train_iter)
+    
+    # 1.1 打印核心指标到控制台
+    print("=" * 65)
+    print(f" 任务间分布差异统计 (Iteration: {train_iter})")
+    print("=" * 65)
+    print(f"参与任务数量: {n_tasks} | 任务ID: {list(task_ids)}")
+    print(f"计算设备: {divergence_data.get('device', 'Unknown')} | GPU加速: {'启用' if divergence_data.get('gpu_accelerated', False) else '禁用'}")
+    print("-" * 65)
+    print("JS散度 (Jensen-Shannon Divergence):")
+    print(f"  平均值: {js_stats['avg']:.6f}  |  最大值: {js_stats['max']:.6f}")
+    print(f"  最小值: {js_stats['min']:.6f}  |  标准差: {js_stats['std']:.6f}")
+    print("-" * 65)
+    print("Wasserstein距离:")
+    print(f"  平均值: {wasserstein_stats['avg']:.6f}  |  最大值: {wasserstein_stats['max']:.6f}")
+    print(f"  最小值: {wasserstein_stats['min']:.6f}  |  标准差: {wasserstein_stats['std']:.6f}")
+    print("=" * 65)
+    
+    # 2. 记录去掉对角线的相似度矩阵热力图
+    task_ids = divergence_data['task_ids']
+    n_tasks = divergence_data['n_tasks']
+    
+    if n_tasks <= 25:  # 限制矩阵大小避免过大热力图
+        try:
+            # JS散度矩阵热力图（无对角线）
+            js_heatmap = create_similarity_heatmap_no_diagonal(
+                divergence_data['js_matrix'], 
+                task_ids, 
+                'js_divergence',
+                f'(Immediate-{n_tasks} tasks)'
+            )
+            tb_logger.add_image(
+                'TaskSimilarity/Immediate_JS_Matrix_NoDiagonal',
+                js_heatmap,
+                global_step=train_iter,
+                dataformats='CHW'
+            )
+            
+            # Wasserstein距离矩阵热力图（无对角线）
+            wass_heatmap = create_similarity_heatmap_no_diagonal(
+                divergence_data['wasserstein_matrix'], 
+                task_ids, 
+                'wasserstein_distance',
+                f'(Immediate-{n_tasks} tasks)'
+            )
+            tb_logger.add_image(
+                'TaskSimilarity/Immediate_Wasserstein_Matrix_NoDiagonal',
+                wass_heatmap,
+                global_step=train_iter,
+                dataformats='CHW'
+            )
+            
+        except Exception as e:
+            print(f"Warning: 相似度矩阵热力图生成失败: {e}")
+    
+    # 3. 记录任务对指标（可选）
+    if n_tasks <= 20:
+        log_pairwise_optimized(tb_logger, divergence_data, train_iter)
+
+
+def collect_and_log_divergences_with_heatmaps(tb_logger, merged_stats, train_iter):
+    """
+    完整的分布差异计算和记录（包含无对角线热力图）
+    """
+    try:
+        # GPU优化计算
+        divergence_data = compute_distribution_divergences_optimized(merged_stats, 'immediate')
+        
+        if not divergence_data:
+            print(f"跳过分布差异计算 - 任务数不足 (需要>=2个任务)")
+            return
+        
+        # 记录指标和热力图
+        log_divergences_with_heatmaps(tb_logger, divergence_data, train_iter)
+        
+        # 汇总打印
+        print(f">> 分布差异统计已完成并记录到TensorBoard")
+        if divergence_data.get('n_tasks', 0) <= 25:
+            print(f">> 相似度矩阵热力图已生成 (去除对角线)")
+        if divergence_data.get('n_tasks', 0) <= 20:
+            print(f">> 任务对详细指标已记录")
+        print()  # 空行分隔
+        
+    except Exception as e:
+        print(f"ERROR: 分布差异计算失败 - {e}")
+        import traceback
+        traceback.print_exc()
+
 # ====== UniZero-MT 归一化所需基准分数 (26 Atari100k task_id 对应索引) ======
 # 原始的 RANDOM_SCORES 和 HUMAN_SCORES
 
@@ -360,6 +1158,7 @@ def compute_task_weights(
 
     return weights
 
+a=1
 def train_unizero_multitask_segment_ddp(
         input_cfg_list: List[Tuple[int, Tuple[dict, dict]]],
         seed: int = 0,
@@ -367,7 +1166,9 @@ def train_unizero_multitask_segment_ddp(
         model_path: Optional[str] = None,
         max_train_iter: Optional[int] = int(1e10),
         max_env_step: Optional[int] = int(1e10),
-        benchmark_name: str = "atari"  
+        benchmark_name: str = "atari",
+        finetune_components=[],
+        cal_moe_profile: bool = False  # 新增：控制MOE性能监控的开关
 ) -> 'Policy':
     """
     Overview:
@@ -467,6 +1268,16 @@ def train_unizero_multitask_segment_ddp(
     # 获取当前进程的rank和总进程数
     rank = get_rank()
     world_size = get_world_size()
+    
+    # 初始化MOE统计性能监控
+    moe_profiler = None
+    if cal_moe_profile and LineProfiler is not None:
+        moe_profiler = LineProfiler()
+        moe_profiler.add_function(collect_and_log_moe_statistics)
+        moe_profiler.enable_by_count()
+        print(f"Rank {rank}: MOE统计性能监控已启用")
+    elif cal_moe_profile and LineProfiler is None:
+        print(f"Rank {rank}: 警告: line_profiler未安装，无法启用MOE性能监控")
 
     # 任务划分
     total_tasks = len(input_cfg_list)
@@ -521,19 +1332,27 @@ def train_unizero_multitask_segment_ddp(
         # 编译配置
         cfg = compile_config(cfg, seed=seed, env=None, auto=True, create_cfg=create_cfg, save_cfg=True)
         # 创建共享的policy
-        policy = create_policy(cfg.policy, model=model, enable_field=['learn', 'collect', 'eval'])
+        
+        # print("===============================")
+        # exit()
+        # 创建TensorBoard日志记录器
+        log_dir = os.path.join('./{}/log'.format(cfg.exp_name), f'serial_rank_{rank}')
+        # global tb_logger
+        tb_logger = SummaryWriter(log_dir)
+        
+        cfg.policy.logger=tb_logger
+        
+        policy = create_policy(cfg.policy, model=model, enable_field=['learn', 'collect', 'eval']) # MOE
 
         # 加载预训练模型（如果提供）
         if model_path is not None:
             logging.info(f'开始加载模型: {model_path}')
-            policy.learn_mode.load_state_dict(torch.load(model_path, map_location=cfg.policy.device))
+            policy.learn_mode.load_state_dict(torch.load(model_path, map_location=cfg.policy.device),finetune_components=finetune_components)
             logging.info(f'完成加载模型: {model_path}')
+       
 
-        # 创建TensorBoard日志记录器
-        log_dir = os.path.join('./{}/log'.format(cfg.exp_name), f'serial_rank_{rank}')
-        tb_logger = SummaryWriter(log_dir)
-
-        # 创建共享的learner
+        # 创建共享的learner  #todo: cfg.policy.learn.learner.hook.log_show_after_iter
+        cfg.policy.learn.learner.hook.log_show_after_iter=100
         learner = BaseLearner(cfg.policy.learn.learner, policy.learn_mode, tb_logger, exp_name=cfg.exp_name)
 
         policy_config = cfg.policy
@@ -589,7 +1408,7 @@ def train_unizero_multitask_segment_ddp(
     # 调用learner的before_run钩子
     learner.call_hook('before_run')
     value_priority_tasks = {}
-
+    
     buffer_reanalyze_count = 0
     train_epoch = 0
     reanalyze_batch_size = cfg.policy.reanalyze_batch_size
@@ -645,6 +1464,7 @@ def train_unizero_multitask_segment_ddp(
             # if learner.train_iter > 10 and evaluator.should_eval(learner.train_iter): # only for debug
             # if evaluator.should_eval(learner.train_iter):
                 print('=' * 20)
+                
                 print(f'Rank {rank} 评估任务_id: {cfg.policy.task_id}...')
 
                 # =========TODO=========
@@ -720,7 +1540,7 @@ def train_unizero_multitask_segment_ddp(
         print(f"not_enough_data:{not_enough_data}")
         # 获取当前温度
         current_temperature_task_weight = temperature_scheduler.get_temperature(learner.train_iter)
-
+        
         # if learner.train_iter == 0 or learner.train_iter % cfg.policy.eval_freq == 0 :
         if learner.train_iter > 10 and learner.train_iter % cfg.policy.eval_freq == 0 :
         
@@ -810,7 +1630,71 @@ def train_unizero_multitask_segment_ddp(
 
                     # 在训练时，DDP会自动同步梯度和参数
                     log_vars = learner.train(train_data_multi_task, envstep_multi_task, policy_kwargs=learn_kwargs)
-
+                    
+                    print("训练结束！！！")
+                    
+                    # +++++++++++++++++++++++++++++++++ MOE专家选择统计记录 +++++++++++++++++++++++++++++++++
+                    # if cfg.policy.model.world_model_cfg.multiplication_moe_in_transformer and cfg.policy.model.world_model_cfg.num_experts_of_moe_in_transformer:
+                    #     # 控制MoE统计记录频率
+                    #     moe_log_interval = getattr(cfg.policy, 'moe_log_interval', 500)  # 默认每500个iter记录一次
+                        
+                    #     if learner.train_iter % moe_log_interval == 0:
+                    #         # # 性能监控开始
+                    #         # if cal_moe_profile:
+                    #         #     import time
+                    #         #     moe_start_time = time.perf_counter()
+                            
+                    #         collect_and_log_moe_statistics(policy, tb_logger, learner.train_iter, world_size, rank)
+                            
+                    #         if rank == 0:  # 只在rank 0打印日志
+                    #             print(f"MoE统计已记录 (train_iter={learner.train_iter})")
+                        
+                    #     # global a
+                    #     # a+=1
+                    #     # 性能监控结束
+                    #     if cal_moe_profile :
+                            
+                    #         if moe_profiler is not None:
+                    #             try:
+                    #                 # 禁用profiler
+                    #                 moe_profiler.disable_by_count()
+                                    
+                    #                 # 生成性能分析报告文件名
+                    #                 profile_filename = f'moe_profile_rank{rank}_train{learner.train_iter}.txt'
+                    #                 profile_path = os.path.join(cfg.exp_name, 'profile', profile_filename)
+                                    
+                    #                 # 确保目录存在
+                    #                 os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+                                    
+                    #                 # 保存性能分析结果到文件
+                    #                 with open(profile_path, 'w') as f:
+                    #                     moe_profiler.print_stats(stream=f)
+                                    
+                    #                 print(f"Rank {rank}: MOE性能分析结果已保存到 {profile_path}")
+                                    
+                    #                 # 也输出到控制台（可选，用于调试）
+                    #                 if rank == 0:  # 只在rank 0输出到控制台，避免混乱
+                    #                     print(f"\n=== Rank {rank}: MOE性能分析摘要 ===")
+                    #                     moe_profiler.print_stats()
+                    #                     print("=" * 50)
+                                        
+                    #             except Exception as e:
+                    #                 print(f"Rank {rank}: 保存MOE性能分析失败: {e}")
+                            
+                            
+                            
+                    #         # moe_end_time = time.perf_counter()
+                    #         # moe_elapsed = (moe_end_time - moe_start_time) * 1000  # 转换为毫秒
+                            
+                    #         # 记录性能指标
+                    #         # tb_logger.add_scalar('Performance/MOE_Statistics_Time_ms', moe_elapsed, global_step=learner.train_iter)
+                            
+                    #         # 打印性能信息（每10次迭代打印一次，避免日志过多）
+                    #         # if learner.train_iter % 10 == 0:
+                    #         #     print(f"Rank {rank}: MOE统计耗时 {moe_elapsed:.2f}ms (train_iter={learner.train_iter})")
+                        
+                    # +++++++++++++++++++++++++++++++++ MOE专家选择统计记录结束 +++++++++++++++++++++++++++++++++
+                    
                     # logging.error(f'Rank {rank}: one learn step done')
 
                     # 判断是否需要计算task_exploitation_weight
@@ -930,4 +1814,7 @@ def train_unizero_multitask_segment_ddp(
 
     # 调用learner的after_run钩子
     learner.call_hook('after_run')
+    
+    # 保存MOE性能监控结果
+    
     return policy
