@@ -63,15 +63,52 @@ def plot_2d_contour(surf_file, surf_name='train_loss', vmin=0.1, vmax=10, vlevel
             continue
 
         Z = np.array(f[key][:])
-        print(f"\nPlotting {key}: min={np.min(Z):.4f}, max={np.max(Z):.4f}")
+        z_min, z_max = np.min(Z), np.max(Z)
+        z_range = z_max - z_min
+        z_mean = np.mean(Z)
+        print(f"\nPlotting {key}: min={z_min:.4f}, max={z_max:.4f}, range={z_range:.6f}")
 
         # Extract metric name (remove 'train_loss_' prefix if present)
         metric_label = key.replace('train_loss_', '')
 
+        # Check if Z has meaningful variation
+        # Use relative variation threshold: range should be at least 0.01% of mean value
+        relative_variation = z_range / z_mean if z_mean != 0 else 0
+        has_variation = z_range > 1e-10 and relative_variation > 1e-6
+
+        if not has_variation:
+            print(f"  Warning: {key} has negligible variation (range={z_range:.2e}, relative={relative_variation:.2e})")
+            print(f"  This suggests the loss landscape is nearly flat in the explored region.")
+            print(f"  Skipping contour plots (not meaningful for constant values)")
+
+            # Still generate a simple heatmap to show the constant value
+            fig = plt.figure(figsize=(12, 10))
+            sns.heatmap(Z, cmap='viridis', cbar=True, annot=False,
+                        xticklabels=False, yticklabels=False)
+            plt.title(f'{metric_label} - Heatmap (Nearly Constant: {z_mean:.4f})', fontsize='x-large')
+            save_path = f"{surf_file}_{key}_2dheat.pdf"
+            fig.savefig(save_path, dpi=300, bbox_inches='tight', format='pdf')
+            print(f"  Saved heatmap only: {save_path}")
+            plt.close(fig)
+            continue
+
+        # Auto-adjust vmin/vmax if needed
+        actual_vmin = vmin if vmin is not None else z_min
+        actual_vmax = vmax if vmax is not None else z_max
+        actual_vlevel = vlevel if vlevel is not None else (actual_vmax - actual_vmin) / 10
+
+        # Ensure valid range
+        if actual_vmin >= actual_vmax:
+            actual_vmin = z_min
+            actual_vmax = z_max
+
+        if actual_vmax - actual_vmin < actual_vlevel:
+            actual_vlevel = (actual_vmax - actual_vmin) / 10
+
         # Plot contour lines
         fig = plt.figure(figsize=(12, 10))
         CS = plt.contour(X, Y, Z, cmap='summer',
-                         levels=np.arange(vmin, vmax, vlevel))
+                         levels=np.arange(actual_vmin, actual_vmax, actual_vlevel))
         plt.clabel(CS, inline=1, fontsize=8)
         plt.xlabel('X Direction', fontsize='x-large')
         plt.ylabel('Y Direction', fontsize='x-large')
@@ -79,11 +116,12 @@ def plot_2d_contour(surf_file, surf_name='train_loss', vmin=0.1, vmax=10, vlevel
         save_path = f"{surf_file}_{key}_2dcontour.pdf"
         fig.savefig(save_path, dpi=300, bbox_inches='tight', format='pdf')
         print(f"  Saved: {save_path}")
+        plt.close(fig)
 
         # Plot filled contours
         fig = plt.figure(figsize=(12, 10))
         CS = plt.contourf(X, Y, Z, cmap='summer',
-                          levels=np.arange(vmin, vmax, vlevel))
+                          levels=np.arange(actual_vmin, actual_vmax, actual_vlevel))
         plt.colorbar(CS, label=metric_label)
         plt.xlabel('X Direction', fontsize='x-large')
         plt.ylabel('Y Direction', fontsize='x-large')
@@ -91,15 +129,17 @@ def plot_2d_contour(surf_file, surf_name='train_loss', vmin=0.1, vmax=10, vlevel
         save_path = f"{surf_file}_{key}_2dcontourf.pdf"
         fig.savefig(save_path, dpi=300, bbox_inches='tight', format='pdf')
         print(f"  Saved: {save_path}")
+        plt.close(fig)
 
         # Plot heatmap
         fig = plt.figure(figsize=(12, 10))
-        sns.heatmap(Z, cmap='viridis', cbar=True, vmin=vmin, vmax=vmax,
+        sns.heatmap(Z, cmap='viridis', cbar=True, vmin=actual_vmin, vmax=actual_vmax,
                     xticklabels=False, yticklabels=False)
         plt.title(f'{metric_label} - Heatmap', fontsize='x-large')
         save_path = f"{surf_file}_{key}_2dheat.pdf"
         fig.savefig(save_path, dpi=300, bbox_inches='tight', format='pdf')
         print(f"  Saved: {save_path}")
+        plt.close(fig)
 
     f.close()
     if show:
@@ -150,7 +190,9 @@ def plot_2d_surface(surf_file, surf_name='train_loss', show=False):
             continue
 
         Z = np.array(f[key][:])
-        print(f"\nPlotting {key}: min={np.min(Z):.4f}, max={np.max(Z):.4f}")
+        z_min, z_max = np.min(Z), np.max(Z)
+        z_range = z_max - z_min
+        print(f"\nPlotting {key}: min={z_min:.4f}, max={z_max:.4f}, range={z_range:.6f}")
 
         # Extract metric name (remove 'train_loss_' prefix if present)
         metric_label = key.replace('train_loss_', '')
@@ -165,11 +207,18 @@ def plot_2d_surface(surf_file, surf_name='train_loss', show=False):
         ax.set_xlabel('X Direction', fontsize='x-large')
         ax.set_ylabel('Y Direction', fontsize='x-large')
         ax.set_zlabel(metric_label, fontsize='x-large')
-        ax.set_title(f'{metric_label} - 3D Surface', fontsize='x-large')
+
+        # Add warning to title if range is very small
+        if z_range < z_min * 1e-6:
+            title = f'{metric_label} - 3D Surface (Nearly Flat)'
+        else:
+            title = f'{metric_label} - 3D Surface'
+        ax.set_title(title, fontsize='x-large')
 
         save_path = f"{surf_file}_{key}_3dsurface.pdf"
         fig.savefig(save_path, dpi=300, bbox_inches='tight', format='pdf')
         print(f"  Saved: {save_path}")
+        plt.close(fig)
 
     f.close()
     if show:

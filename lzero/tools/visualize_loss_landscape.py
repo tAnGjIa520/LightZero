@@ -10,6 +10,11 @@ Usage:
         --checkpoint data_lz/data_unizero/Pong/xxx/ckpt/ckpt_best.pth.tar \\
         --env PongNoFrameskip-v4 \\
         --seed 0
+        
+        我想实现 ezv2 请你阅读/mnt/shared-storage-user/tangjia/temp/EfficientZeroV2/ez/mcts 下面的代码,掌握 ezv2 的逻辑然后帮我在/mnt/shared-storage-user/tangjia/eff/LightZero/lzero/mcts/ptree 下面创建一个 ptree_ezv2.py
+  文件,/mnt/shared-storage-user/tangjia/eff/LightZero/lzero/mcts/ptree也有 ez 的实现,ez 已经在/mnt/shared-storage-user/tangjia/eff/LightZero/lzero/mcts/ptree 下面了,我现在需要实现 ezv2 
+        
+        
 """
 import os
 import sys
