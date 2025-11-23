@@ -1,9 +1,8 @@
 from easydict import EasyDict
-
 from zoo.atari.config.atari_env_action_space_map import atari_env_action_space_map
 
 
-def main(env_id='PongNoFrameskip-v4', seed=0, ckpt=None, log_dir=None):
+def main(env_id, seed):
     action_space_size = atari_env_action_space_map[env_id]
 
     # ==============================================================
@@ -27,9 +26,17 @@ def main(env_id='PongNoFrameskip-v4', seed=0, ckpt=None, log_dir=None):
     reanalyze_batch_size = 160
     # The partition of reanalyze. E.g., 1 means reanalyze_batch samples from the whole buffer, 0.5 means samples from the first half of the buffer.
     reanalyze_partition = 0.75
+
+    # ====== only for debug =====
+    # collector_env_num = 2
+    # num_segments = 2
+    # evaluator_env_num = 2
+    # num_simulations = 10
+    # batch_size = 5
     # ==============================================================
     # end of the most frequently changed config specified by the user
     # ==============================================================
+
     atari_unizero_config = dict(
         env=dict(
             stop_value=int(1e6),
@@ -70,7 +77,7 @@ def main(env_id='PongNoFrameskip-v4', seed=0, ckpt=None, log_dir=None):
                 ),
             ),
             # (str) The path of the pretrained model. If None, the model will be initialized by the default model.
-            model_path=ckpt,
+            model_path=None,
             use_augmentation=False,
             manual_temperature_decay=False,
             threshold_training_steps_for_final_temperature=int(2.5e4),
@@ -117,24 +124,17 @@ def main(env_id='PongNoFrameskip-v4', seed=0, ckpt=None, log_dir=None):
     atari_unizero_create_config = EasyDict(atari_unizero_create_config)
     create_config = atari_unizero_create_config
 
-    # Set exp_name based on log_dir if provided, otherwise use default
-    if log_dir is not None:
-        main_config.exp_name = log_dir
-    else:
-        main_config.exp_name = f'data_lz/data_unizero/{env_id[:-14]}/{env_id[:-14]}_uz_nlayer{num_layers}_gsl{game_segment_length}_rr{replay_ratio}_Htrain{num_unroll_steps}-Hinfer{infer_context_length}_bs{batch_size}_seed{seed}'
-
-    from lzero.entry import plot_loss_landscape
-    plot_loss_landscape([main_config, create_config], seed=seed, model_path=main_config.policy.model_path, max_env_step=max_env_step)
+    # ============ use muzero_segment_collector instead of muzero_collector =============
+    from lzero.entry import train_unizero_segment
+    main_config.exp_name = f'data_lz/data_unizero/{env_id[:-14]}/{env_id[:-14]}_uz_brf{buffer_reanalyze_freq}-rbs{reanalyze_batch_size}-rp{reanalyze_partition}_nlayer{num_layers}_numsegments-{num_segments}_gsl{game_segment_length}_rr{replay_ratio}_Htrain{num_unroll_steps}-Hinfer{infer_context_length}_bs{batch_size}_seed{seed}'
+    train_unizero_segment([main_config, create_config], seed=seed, model_path=main_config.policy.model_path, max_env_step=max_env_step)
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description='Process some environment.')
+    parser = argparse.ArgumentParser(description='Process different environments and seeds.')
     parser.add_argument('--env', type=str, help='The environment to use', default='PongNoFrameskip-v4')
     parser.add_argument('--seed', type=int, help='The seed to use', default=0)
-    parser.add_argument('--ckpt', type=str, help='Path to checkpoint file', default=None)
-    parser.add_argument('--log_dir', type=str, help='Log directory for output', default=None)
     args = parser.parse_args()
 
-    main(args.env, args.seed, args.ckpt, args.log_dir)
-
+    main(args.env, args.seed)
