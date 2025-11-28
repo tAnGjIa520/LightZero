@@ -4,8 +4,8 @@ from easydict import EasyDict
 # 最常修改的配置参数
 # ==============================================================
 # 多GPU配置
-use_multi_gpu = True  # 开启多GPU训练
-gpu_num = 8  # 使用的GPU数量，根据实际情况修改
+use_multi_gpu = False  # 开启多GPU训练
+gpu_num = 1  # 使用的GPU数量，根据实际情况修改
 batch_size = 128
 
 collector_env_num = 4

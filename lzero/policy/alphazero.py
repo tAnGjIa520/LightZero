@@ -249,6 +249,10 @@ class AlphaZeroPolicy(Policy):
             - output (:obj:`Dict[str, torch.Tensor]`): The dict of output, the key is env_id and the value is the \
                 the corresponding policy output in this timestep, including action, probs and so on.
         """
+        import pudb
+        pudb.set_trace()
+        # breakpoint()
+        
         self.collect_mcts_temperature = temperature
         ready_env_id = list(obs.keys())
         init_state = {env_id: obs[env_id]['board'] for env_id in ready_env_id}

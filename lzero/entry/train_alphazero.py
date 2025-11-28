@@ -14,6 +14,7 @@ from tensorboardX import SummaryWriter
 
 from lzero.policy import visit_count_temperature
 from lzero.worker import AlphaZeroCollector, AlphaZeroEvaluator
+from lzero.utils.monitor import monitor_performance, print_system_info
 
 
 def train_alphazero(

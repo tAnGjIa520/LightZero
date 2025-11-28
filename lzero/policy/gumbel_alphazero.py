@@ -249,7 +249,7 @@ class GumbelAlphaZeroPolicy(Policy):
         self._collect_model = self._model
         if self._cfg.mcts_ctree:
             import sys
-            sys.path.append('/Users/your_user_name/code/LightZero/lzero/mcts/ctree/ctree_gumbel_alphazero/build')  # TODO: change this path to your own path
+            sys.path.append('/mnt/shared-storage-user/tangjia/chess/LightZero/lzero/mcts/ctree/ctree_gumbel_alphazero_pro/build')  # TODO: change this path to your own path
             import mcts_gumbel_alphazero
             self._collect_mcts = mcts_gumbel_alphazero.MCTS(self._cfg.mcts.max_moves, self._cfg.mcts.num_simulations,
                                                             self._cfg.mcts.pb_c_base,
@@ -275,6 +275,7 @@ class GumbelAlphaZeroPolicy(Policy):
         """
         Overview:
             The forward function for collecting data in collect mode. Use real env to execute MCTS search.
+            Supports both sequential and batch inference modes based on configuration.
         Arguments:
             - obs (:obj:`Dict`): The dict of obs, the key is env_id and the value is the \
                 corresponding obs in this timestep.
@@ -283,33 +284,180 @@ class GumbelAlphaZeroPolicy(Policy):
             - output (:obj:`Dict[str, torch.Tensor]`): The dict of output, the key is env_id and the value is the \
                 the corresponding policy output in this timestep, including action, probs and so on.
         """
+        # Check if batch inference mode is enabled
+        use_batch_mode = self._cfg.get('use_batch_inference', False)
+
+        if use_batch_mode:
+            return self._forward_collect_batch(obs, temperature)
+        else:
+            # Original sequential MCTS mode
+            self.collect_mcts_temperature = temperature
+            ready_env_id = list(obs.keys())
+            init_state = {env_id: obs[env_id]['board'] for env_id in ready_env_id}
+            # If 'katago_game_state' is in the observation of the given environment ID, it's value is used.
+            # If it's not present (which will raise a KeyError), None is used instead.
+            # This approach is taken to maintain compatibility with the handling of 'katago' related parts of 'alphazero_mcts_ctree' in Go.
+            katago_game_state = {env_id: obs[env_id].get('katago_game_state', None) for env_id in ready_env_id}
+            start_player_index = {env_id: obs[env_id]['current_player_index'] for env_id in ready_env_id}
+            output = {}
+            self._policy_model = self._collect_model
+            for env_id in ready_env_id:
+                state_config_for_env_reset = EasyDict(dict(start_player_index=start_player_index[env_id],
+                                                           init_state=init_state[env_id],
+                                                           katago_policy_init=True,
+                                                           katago_game_state=katago_game_state[env_id]))
+
+                action, mcts_probs, improved_probs = self._collect_mcts.get_next_action(
+                    state_config_for_env_reset,
+                    self._policy_value_fn,
+                    self.collect_mcts_temperature,
+                    True,
+                )
+                output[env_id] = {
+                    'action': action,
+                    'probs': mcts_probs,
+                    'improved_probs': improved_probs,
+                }
+
+            return output
+
+    @torch.no_grad()
+    def _forward_collect_batch(self, obs: Dict, temperature: float = 1) -> Dict[str, torch.Tensor]:
+        """
+        Cross-environment batch MCTS: All environments synchronously execute simulations
+        with batch inference for better GPU utilization.
+
+        Args:
+            obs: Dict of observations keyed by env_id
+            temperature: MCTS temperature
+
+        Returns:
+            output: Dict of actions, probs, and improved_probs for each env_id
+        """
+        import sys
+        sys.path.append('/mnt/shared-storage-user/tangjia/chess/LightZero/lzero/mcts/ctree/ctree_gumbel_alphazero_pro/build')
+        import mcts_gumbel_alphazero
+
         self.collect_mcts_temperature = temperature
         ready_env_id = list(obs.keys())
+        num_envs = len(ready_env_id)
+
+        if num_envs == 0:
+            return {}
+
+        # Prepare configurations for all environments
         init_state = {env_id: obs[env_id]['board'] for env_id in ready_env_id}
-        # If 'katago_game_state' is in the observation of the given environment ID, it's value is used.
-        # If it's not present (which will raise a KeyError), None is used instead.
-        # This approach is taken to maintain compatibility with the handling of 'katago' related parts of 'alphazero_mcts_ctree' in Go.
         katago_game_state = {env_id: obs[env_id].get('katago_game_state', None) for env_id in ready_env_id}
         start_player_index = {env_id: obs[env_id]['current_player_index'] for env_id in ready_env_id}
-        output = {}
-        self._policy_model = self._collect_model
-        for env_id in ready_env_id:
-            state_config_for_env_reset = EasyDict(dict(start_player_index=start_player_index[env_id],
-                                                       init_state=init_state[env_id],
-                                                       katago_policy_init=True,
-                                                       katago_game_state=katago_game_state[env_id]))
 
-            action, mcts_probs, improved_probs = self._collect_mcts.get_next_action(
-                state_config_for_env_reset,
-                self._policy_value_fn,
-                self.collect_mcts_temperature,
+        self._policy_model = self._collect_model
+
+        # Initialize MCTS search states for all environments
+        search_states = {}
+        for env_id in ready_env_id:
+            state_config = EasyDict(dict(
+                start_player_index=start_player_index[env_id],
+                init_state=init_state[env_id],
+                katago_policy_init=True,
+                katago_game_state=katago_game_state[env_id]
+            ))
+            search_states[env_id] = self._collect_mcts.init_search(state_config, True)
+
+        # First expand all root nodes
+        root_env_list = []
+        for env_id in ready_env_id:
+            # Reset environment to initial state
+            self.simulate_env.reset(
+                start_player_index[env_id],
+                init_state[env_id],
                 True,
+                katago_game_state[env_id]
             )
-            output[env_id] = {
-                'action': action,
-                'probs': mcts_probs,
-                'improved_probs': improved_probs,
-            }
+            root_env_list.append(self.simulate_env)
+
+        # Batch inference for root nodes
+        if len(root_env_list) > 0:
+            action_probs_list, values_list = self._policy_value_fn_batch(root_env_list)
+
+            for env_id, action_probs, value in zip(ready_env_id, action_probs_list, values_list):
+                # Expand root node
+                root = search_states[env_id].root
+                root.raw_value = value
+                for action, prior_p in action_probs.items():
+                    child = mcts_gumbel_alphazero.Node(root, prior_p)
+                    root.add_child(action, child)
+
+            # Add exploration noise
+            for env_id in ready_env_id:
+                self._collect_mcts._add_exploration_noise(search_states[env_id].root)
+
+        # Synchronously execute simulations for all environments
+        num_simulations = self._cfg.mcts.num_simulations
+
+        for sim_idx in range(num_simulations):
+            # Each environment executes one simulation step
+            leaf_nodes = []
+            leaf_env_list = []
+            env_id_for_leaf = []
+
+            for env_id in ready_env_id:
+                try:
+                    leaf_node = self._collect_mcts.simulate_one_step(search_states[env_id])
+
+                    # Check if environment reached terminal state
+                    if not self.simulate_env.done:
+                        leaf_nodes.append(leaf_node)
+                        leaf_env_list.append(self.simulate_env)
+                        env_id_for_leaf.append(env_id)
+                    else:
+                        # Terminal state: expand with empty action probs and value 0
+                        self._collect_mcts.expand_and_backprop(
+                            leaf_node,
+                            self.simulate_env,
+                            {},
+                            0.0
+                        )
+                except Exception as e:
+                    import logging
+                    logging.error(f"Error in env {env_id} simulation {sim_idx}: {e}")
+                    continue
+
+            # Batch inference for all leaf nodes
+            if len(leaf_nodes) > 0:
+                action_probs_list, values_list = self._policy_value_fn_batch(leaf_env_list)
+
+                # Expand nodes and backpropagate values
+                for leaf_node, env_state, action_probs, value in zip(
+                    leaf_nodes, leaf_env_list, action_probs_list, values_list
+                ):
+                    self._collect_mcts.expand_and_backprop(
+                        leaf_node,
+                        env_state,
+                        action_probs,
+                        value
+                    )
+
+        # Extract final actions from all search states
+        output = {}
+        for env_id in ready_env_id:
+            try:
+                action, mcts_probs, improved_probs = self._collect_mcts.get_action_from_search_state(
+                    search_states[env_id],
+                    self.collect_mcts_temperature,
+                    True
+                )
+                output[env_id] = {
+                    'action': action,
+                    'probs': mcts_probs,
+                    'improved_probs': improved_probs,
+                }
+
+                # Clean up search state
+                self._collect_mcts.cleanup_search_state(search_states[env_id])
+            except Exception as e:
+                import logging
+                logging.error(f"Error extracting action for env {env_id}: {e}")
+                continue
 
         return output
 
@@ -408,6 +556,53 @@ class GumbelAlphaZeroPolicy(Policy):
         legal_action_probs_dict = dict(
             zip(legal_actions, action_probs.squeeze(0)[legal_actions].detach().cpu().numpy()))
         return legal_action_probs_dict, value.item()
+
+    @torch.no_grad()
+    def _policy_value_fn_batch(self, env_list: List) -> Tuple[List[Dict], List[float]]:
+        """
+        Batch inference for multiple environments.
+
+        Args:
+            env_list: List of environment objects
+
+        Returns:
+            action_probs_list: List of action probability dicts
+            values_list: List of state values
+        """
+        if len(env_list) == 0:
+            return [], []
+
+        # 1. Collect all states and legal actions
+        states_list = []
+        legal_actions_list = []
+
+        for env in env_list:
+            legal_actions = env.legal_actions
+            _, current_state_scale = env.current_state()
+            states_list.append(current_state_scale)
+            legal_actions_list.append(legal_actions)
+
+        # 2. Batch inference
+        states_batch = torch.from_numpy(np.stack(states_list)).to(
+            device=self._device, dtype=torch.float
+        )  # shape: [batch_size, C, H, W]
+
+        with torch.no_grad():
+            action_probs_batch, values_batch = self._policy_model.compute_policy_value(states_batch)
+
+        # 3. Split results
+        action_probs_list = []
+        values_list = []
+
+        for i in range(len(env_list)):
+            legal_actions = legal_actions_list[i]
+            action_probs = action_probs_batch[i][legal_actions].detach().cpu().numpy()
+            legal_action_probs_dict = dict(zip(legal_actions, action_probs))
+
+            action_probs_list.append(legal_action_probs_dict)
+            values_list.append(values_batch[i].item())
+
+        return action_probs_list, values_list
 
     def _monitor_vars_learn(self) -> List[str]:
         """
