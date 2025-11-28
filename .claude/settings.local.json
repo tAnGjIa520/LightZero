@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(for dir in chess chinesechess connect4 go gomoku tictactoe)",
+      "Bash(do)",
+      "Bash(echo:*)",
+      "Bash(ls:*)",
+      "Bash(done)",
+      "Bash(do echo \"=== $dir envs ===\" find /mnt/shared-storage-user/tangjia/chess/LightZero/zoo/board_games/$dir/envs -type f -name \"*.py\")",
+      "Bash(for dir in /mnt/shared-storage-user/tangjia/unizero/LightZero/data_lz/loss_landscape_batch/iteration_*/)",
+      "Bash(do echo '=== $(basename $dir) ===')",
+      "Bash(for dir in iteration_*/)",
+      "Bash(do echo '=== $dir ===')",
+      "Bash(while read dir)",
+      "Bash(python generate_loss_landscape_table.py:*)",
+      "Bash(python copy_and_organize.py:*)",
+      "Bash(python markdown_to_pdf.py:*)",
+      "Bash(pip install:*)",
+      "Bash(python markdown_to_pdf_v2.py:*)",
+      "Bash(tree:*)",
+      "Bash(git diff:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

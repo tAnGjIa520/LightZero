@@ -131,7 +131,7 @@ public:
         return std::make_pair(action, child);
     }
 
-    // Expand a leaf node by adding its children based on policy probabilities
+    // 单个叶节点扩展 - 用于非batch情况
     double _expand_leaf_node(std::shared_ptr<Node> node, py::object simulate_env, py::object policy_value_func) {
         std::map<int, double> action_probs_dict;
         double leaf_value;
@@ -155,6 +155,284 @@ public:
         }
 
         return leaf_value;
+    }
+
+    // 批量扩展多个叶节点 - 用于并行batch推理
+    // 返回所有叶节点的值列表
+    std::vector<double> _batch_expand_leaf_nodes(
+        const std::vector<std::shared_ptr<Node>>& leaf_nodes,
+        const std::vector<py::object>& simulate_envs,
+        py::object policy_value_func_batch
+    ) {
+        // 检查输入合法性
+        if (leaf_nodes.empty() || simulate_envs.empty()) {
+            return std::vector<double>();
+        }
+
+        int batch_size = leaf_nodes.size();
+        std::vector<double> leaf_values(batch_size);
+
+        // ========== Step 1: 收集所有环境的合法动作和当前状态 ==========
+        py::list env_list;
+        for (int i = 0; i < batch_size; ++i) {
+            env_list.append(simulate_envs[i]);
+        }
+
+        // ========== Step 2: 批量调用policy_value_func_batch ==========
+        // 返回所有叶节点的策略和价值
+        py::list batch_results = policy_value_func_batch(env_list).cast<py::list>();
+
+        // ========== Step 3: 为每个叶节点添加子节点 ==========
+        for (int i = 0; i < batch_size; ++i) {
+            py::object env = simulate_envs[i];
+            std::shared_ptr<Node> node = leaf_nodes[i];
+
+            // 解析batch推理的结果
+            py::tuple result = batch_results[i].cast<py::tuple>();
+            std::map<int, double> action_probs_dict = result[0].cast<std::map<int, double>>();
+            double leaf_value = result[1].cast<double>();
+
+            leaf_values[i] = leaf_value;
+
+            // 获取合法动作
+            py::list legal_actions_list = env.attr("legal_actions").cast<py::list>();
+            std::vector<int> legal_actions = legal_actions_list.cast<std::vector<int>>();
+
+            // 为合法动作添加子节点
+            for (const auto& kv : action_probs_dict) {
+                int action = kv.first;
+                double prior_p = kv.second;
+                if (std::find(legal_actions.begin(), legal_actions.end(), action) != legal_actions.end()) {
+                    node->children[action] = std::make_shared<Node>(node, prior_p);
+                }
+            }
+        }
+
+        return leaf_values;
+    }
+
+    // 批处理版本: 为多个环境获取下一步动作 (支持batch推理优化)
+    std::vector<std::tuple<int, std::vector<double>, std::shared_ptr<Node>>> get_next_actions_batch(
+        py::list state_configs_list,
+        py::object policy_value_func_batch,
+        double temperature,
+        bool sample,
+        py::list simulate_env_list  // 新增: 每个环境一个独立的env实例
+    ) {
+        int batch_size = py::len(state_configs_list);
+        std::vector<std::tuple<int, std::vector<double>, std::shared_ptr<Node>>> results;
+        results.reserve(batch_size);
+
+        std::vector<std::shared_ptr<Node>> roots;
+        roots.reserve(batch_size);
+
+        // ========== Step 1: 准备初始状态 ==========
+        std::vector<py::object> init_states;
+        std::vector<py::object> katago_game_states;
+        init_states.reserve(batch_size);
+        katago_game_states.reserve(batch_size);
+
+        for (int i = 0; i < batch_size; ++i) {
+            roots.push_back(std::make_shared<Node>());
+            py::object state_config = state_configs_list[i].cast<py::object>();
+
+            py::object init_state = state_config["init_state"];
+            if (!init_state.is_none()) {
+                init_state = py::bytes(init_state.attr("tobytes")());
+            }
+            init_states.push_back(init_state);
+
+            py::object katago_game_state = state_config["katago_game_state"];
+            if (!katago_game_state.is_none()) {
+                katago_game_state = py::module::import("pickle").attr("dumps")(katago_game_state);
+            }
+            katago_game_states.push_back(katago_game_state);
+        }
+
+        // ========== Step 2: 批量扩展所有root节点 ==========
+        // 收集所有环境对象 (每个环境使用独立的env实例)
+        py::list env_list;
+        for (int i = 0; i < batch_size; ++i) {
+            py::object state_config = state_configs_list[i].cast<py::object>();
+            py::object env = simulate_env_list[i];  // 使用独立的env实例
+            env.attr("reset")(
+                state_config["start_player_index"].cast<int>(),
+                init_states[i],
+                state_config["katago_policy_init"].cast<bool>(),
+                katago_game_states[i]
+            );
+            env_list.append(env);
+        }
+
+        // 一次性batch推理所有root节点
+        py::list batch_results = policy_value_func_batch(env_list).cast<py::list>();
+
+        // 解析结果并扩展root节点
+        for (int i = 0; i < batch_size; ++i) {
+            py::object env = simulate_env_list[i];  // 使用独立的env实例
+
+            py::tuple result = batch_results[i].cast<py::tuple>();
+            std::map<int, double> action_probs_dict = result[0].cast<std::map<int, double>>();
+
+            py::list legal_actions_list = env.attr("legal_actions").cast<py::list>();
+            std::vector<int> legal_actions = legal_actions_list.cast<std::vector<int>>();
+
+            for (const auto& kv : action_probs_dict) {
+                if (std::find(legal_actions.begin(), legal_actions.end(), kv.first) != legal_actions.end()) {
+                    roots[i]->children[kv.first] = std::make_shared<Node>(roots[i], kv.second);
+                }
+            }
+
+            if (sample) {
+                _add_exploration_noise(roots[i]);
+            }
+        }
+
+        // ========== Step 3: 并行同步MCTS模拟 - 批量推理优化 ==========
+        // 外层循环: num_simulations次
+        for (int n = 0; n < num_simulations; ++n) {
+            // 重置所有环境并执行一轮模拟
+            std::vector<SimulationResult> simulation_results;
+            simulation_results.reserve(batch_size);
+
+            // 第1步: 所有环境同步执行一轮模拟到叶节点
+            for (int i = 0; i < batch_size; ++i) {
+                py::object state_config = state_configs_list[i].cast<py::object>();
+                py::object env = simulate_env_list[i];
+
+                // 重置环境到初始状态
+                env.attr("reset")(
+                    state_config["start_player_index"].cast<int>(),
+                    init_states[i],
+                    state_config["katago_policy_init"].cast<bool>(),
+                    katago_game_states[i]
+                );
+                env.attr("battle_mode") = env.attr("battle_mode_in_simulation_env");
+
+                // 从root向下选择到叶节点 (不做推理)
+                SimulationResult sim_result = _simulate_to_leaf(roots[i], env);
+                simulation_results.push_back(sim_result);
+            }
+
+            // 第2步: 收集所有未完成游戏的叶节点进行batch推理
+            std::vector<int> unfinished_indices;  // 记录未完成的游戏索引
+            std::vector<std::shared_ptr<Node>> leaf_nodes_to_expand;
+            std::vector<py::object> envs_to_infer;
+
+            for (int i = 0; i < batch_size; ++i) {
+                if (!simulation_results[i].is_done) {
+                    unfinished_indices.push_back(i);
+                    leaf_nodes_to_expand.push_back(simulation_results[i].leaf_node);
+                    envs_to_infer.push_back(simulation_results[i].simulate_env);
+                }
+            }
+
+            // 如果有未完成的游戏, 进行batch推理
+            std::vector<double> leaf_values;
+            if (!unfinished_indices.empty()) {
+                leaf_values = _batch_expand_leaf_nodes(
+                    leaf_nodes_to_expand,
+                    envs_to_infer,
+                    policy_value_func_batch
+                );
+            }
+
+            // 第3步: 更新所有节点的visit count和value
+            for (int i = 0; i < batch_size; ++i) {
+                std::shared_ptr<Node> leaf_node = simulation_results[i].leaf_node;
+                py::object env = simulation_results[i].simulate_env;
+                double leaf_value;
+
+                if (simulation_results[i].is_done) {
+                    // 游戏已结束, 计算终局价值
+                    std::string battle_mode = env.attr("battle_mode_in_simulation_env").cast<std::string>();
+                    int winner = simulation_results[i].winner;
+
+                    if (battle_mode == "self_play_mode") {
+                        if (winner == -1) {
+                            leaf_value = 0;
+                        } else {
+                            leaf_value = (env.attr("current_player").cast<int>() == winner) ? 1 : -1;
+                        }
+                    }
+                    else if (battle_mode == "play_with_bot_mode") {
+                        if (winner == -1) {
+                            leaf_value = 0;
+                        }
+                        else if (winner == 1) {
+                            leaf_value = 1;
+                        }
+                        else if (winner == 2) {
+                            leaf_value = -1;
+                        }
+                    }
+                } else {
+                    // 从batch推理结果中获取该环境的叶值
+                    // 找到这个环境在unfinished_indices中的位置
+                    auto it = std::find(unfinished_indices.begin(), unfinished_indices.end(), i);
+                    if (it != unfinished_indices.end()) {
+                        int result_idx = std::distance(unfinished_indices.begin(), it);
+                        leaf_value = leaf_values[result_idx];
+                    } else {
+                        // 不应该发生的情况
+                        leaf_value = 0;
+                    }
+                }
+
+                // 反向传播更新节点
+                std::string battle_mode = env.attr("battle_mode_in_simulation_env").cast<std::string>();
+                if (battle_mode == "play_with_bot_mode") {
+                    leaf_node->update_recursive(leaf_value, battle_mode);
+                }
+                else if (battle_mode == "self_play_mode") {
+                    leaf_node->update_recursive(-leaf_value, battle_mode);
+                }
+            }
+        }
+
+        // ========== Step 4: 选择最终动作 ==========
+        for (int i = 0; i < batch_size; ++i) {
+            py::object state_config = state_configs_list[i].cast<py::object>();
+            py::object env = simulate_env_list[i];  // 使用独立的env实例
+
+            // 重置环境以获取action_space
+            env.attr("reset")(
+                state_config["start_player_index"].cast<int>(),
+                init_states[i],
+                state_config["katago_policy_init"].cast<bool>(),
+                katago_game_states[i]
+            );
+
+            std::vector<std::pair<int, int>> action_visits;
+            for (int action = 0; action < env.attr("action_space").attr("n").cast<int>(); ++action) {
+                if (roots[i]->children.count(action)) {
+                    action_visits.emplace_back(action, roots[i]->children[action]->visit_count);
+                } else {
+                    action_visits.emplace_back(action, 0);
+                }
+            }
+
+            std::vector<int> actions;
+            std::vector<int> visits;
+            for (const auto& av : action_visits) {
+                actions.emplace_back(av.first);
+                visits.emplace_back(av.second);
+            }
+
+            std::vector<double> visits_d(visits.begin(), visits.end());
+            std::vector<double> action_probs = visit_count_to_action_distribution(visits_d, temperature);
+
+            int action_selected;
+            if (sample) {
+                action_selected = random_choice(actions, action_probs);
+            } else {
+                action_selected = actions[std::distance(action_probs.begin(), std::max_element(action_probs.begin(), action_probs.end()))];
+            }
+
+            results.push_back(std::make_tuple(action_selected, action_probs, roots[i]));
+        }
+
+        return results;
     }
 
     // Main function to get the next action from MCTS
@@ -228,7 +506,39 @@ public:
         return std::make_tuple(action_selected, action_probs, root);
     }
 
-    // Simulate a game starting from a given node
+    // 新结构体：记录单次模拟的结果 (用于并行batch推理)
+    struct SimulationResult {
+        std::shared_ptr<Node> leaf_node;      // 叶节点指针
+        bool is_done;                          // 游戏是否结束
+        int winner;                            // 获胜者 (-1 未结束, 1/2 获胜, 0 平局)
+        py::object simulate_env;               // 对应的环境
+    };
+
+    // 单次模拟：从根到叶节点（不做推理，只返回叶节点信息）
+    SimulationResult _simulate_to_leaf(std::shared_ptr<Node> node, py::object simulate_env) {
+        // 从root向下选择到叶节点
+        while (!node->is_leaf()) {
+            int action;
+            std::shared_ptr<Node> child;
+            std::tie(action, child) = _select_child(node, simulate_env);
+            if (action == -1) {
+                break;
+            }
+            simulate_env.attr("step")(action);
+            node = child;
+        }
+
+        // 获取游戏状态
+        bool done;
+        int winner;
+        py::tuple result = simulate_env.attr("get_done_winner")();
+        done = result[0].cast<bool>();
+        winner = result[1].cast<int>();
+
+        return SimulationResult{node, done, winner, simulate_env};
+    }
+
+    // 旧的单环境模拟函数（保留向后兼容）
     void _simulate(std::shared_ptr<Node> node, py::object simulate_env, py::object policy_value_func) {
         while (!node->is_leaf()) {
             int action;
@@ -372,5 +682,11 @@ PYBIND11_MODULE(mcts_alphazero, m) {
              py::arg("state_config_for_env_reset"),
              py::arg("policy_value_func"),
              py::arg("temperature"),
-             py::arg("sample"));
+             py::arg("sample"))
+        .def("get_next_actions_batch", &MCTS::get_next_actions_batch,
+             py::arg("state_configs_list"),
+             py::arg("policy_value_func_batch"),
+             py::arg("temperature"),
+             py::arg("sample"),
+             py::arg("simulate_env_list"));  // 新增参数
 }
