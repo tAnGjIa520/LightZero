@@ -1,3 +1,0 @@
-/mnt/shared-storage-user/tangjia/chess/LightZero/lzero/mcts/ctree/ctree_alphazero/build/CMakeFiles/mcts_alphazero.dir
-/mnt/shared-storage-user/tangjia/chess/LightZero/lzero/mcts/ctree/ctree_alphazero/build/CMakeFiles/edit_cache.dir
-/mnt/shared-storage-user/tangjia/chess/LightZero/lzero/mcts/ctree/ctree_alphazero/build/CMakeFiles/rebuild_cache.dir
