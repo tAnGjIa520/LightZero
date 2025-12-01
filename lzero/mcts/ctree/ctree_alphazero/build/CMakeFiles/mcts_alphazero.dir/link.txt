@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -flto=auto -shared  -o mcts_alphazero.cpython-310-x86_64-linux-gnu.so CMakeFiles/mcts_alphazero.dir/mcts_alphazero.cpp.o CMakeFiles/mcts_alphazero.dir/node_alphazero.cpp.o 

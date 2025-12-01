@@ -1434,10 +1434,10 @@ events.*
 # LightZero special key
 /zoo/board_games/**/*.c
 /zoo/board_games/**/*.cpp
-/lzero/mcts/**/*.cpp
+# /lzero/mcts/**/*.cpp
 /zoo/**/*.c
 /lzero/mcts/**/*.so
-/lzero/mcts/**/*.h
+# /lzero/mcts/**/*.h
 !/lzero/mcts/**/lib
 !/lzero/mcts/**/lib/*.cpp
 !/lzero/mcts/**/lib/*.hpp
@@ -1449,5 +1449,8 @@ events.*
 # pooltool-specific stuff
 !/assets/pooltool/**
 lzero/mcts/ctree/ctree_alphazero/pybind11
+
+# Track ctree_alphazero source files
+!/lzero/mcts/ctree/ctree_alphazero/**
 
 zoo/jericho/envs/z-machine-games-master
