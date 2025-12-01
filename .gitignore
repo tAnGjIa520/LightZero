@@ -1434,14 +1434,18 @@ events.*
 # LightZero special key
 /zoo/board_games/**/*.c
 /zoo/board_games/**/*.cpp
-# /lzero/mcts/**/*.cpp
+/lzero/mcts/**/*.cpp
 /zoo/**/*.c
 /lzero/mcts/**/*.so
-# /lzero/mcts/**/*.h
+/lzero/mcts/**/*.h
 !/lzero/mcts/**/lib
 !/lzero/mcts/**/lib/*.cpp
 !/lzero/mcts/**/lib/*.hpp
 !/lzero/mcts/**/lib/*.h
+# Track ctree_alphazero source files (override above rules)
+!/lzero/mcts/ctree/ctree_alphazero/*.cpp
+!/lzero/mcts/ctree/ctree_alphazero/*.h
+!/lzero/mcts/ctree/ctree_alphazero/*.txt
 **/tb/*
 **/mcts/ctree/tests_cpp/*
 **/*tmp*
@@ -1451,6 +1455,9 @@ events.*
 lzero/mcts/ctree/ctree_alphazero/pybind11
 
 # Track ctree_alphazero source files
-!/lzero/mcts/ctree/ctree_alphazero/**
+!/lzero/mcts/ctree/ctree_alphazero/*.cpp
+!/lzero/mcts/ctree/ctree_alphazero/*.h
+!/lzero/mcts/ctree/ctree_alphazero/CMakeLists.txt
+!/lzero/mcts/ctree/ctree_alphazero/make.sh
 
 zoo/jericho/envs/z-machine-games-master
