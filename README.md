@@ -1,6 +1,6 @@
 <div id="top"></div>
 
-# LightZero1
+# LightZero
 
 <div align="center">
     <img width="1000px" height="auto" src="https://github.com/opendilab/LightZero/blob/main/LightZero.png"></a>
