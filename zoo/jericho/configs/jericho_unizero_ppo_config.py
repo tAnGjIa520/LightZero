@@ -18,7 +18,7 @@ def main(env_id: str = 'detective.z5', seed: int = 0, max_env_step: int = int(1e
     """
     env_id = 'detective.z5'
 
-    collector_env_num: int = 4       # Number of collector environments
+    collector_env_num: int = 1       # Number of collector environments
     n_episode = int(collector_env_num)
     batch_size=64
 
@@ -62,9 +62,9 @@ def main(env_id: str = 'detective.z5', seed: int = 0, max_env_step: int = int(1e
     encoder_option = 'legacy'        # ['qwen', 'legacy']. Legacy uses the bge encoder
 
     if encoder_option == 'qwen':
-        model_name: str = 'Qwen/Qwen3-0.6B'
+        model_name: str = '/mnt/shared-storage-user/tangjia/models/Qwen3-0.6B'
     elif encoder_option == 'legacy':
-        model_name: str = 'BAAI/bge-base-en-v1.5'
+        model_name: str = '/mnt/shared-storage-user/tangjia/models/bge-base-en-v1.5'
     else:
         raise ValueError(f"Unsupported encoder option: {encoder_option}")    
 
