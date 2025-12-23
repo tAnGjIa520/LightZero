@@ -1063,21 +1063,26 @@ class PredictionNetwork(nn.Module):
     """
     def __init__(
             self,
+            observation_shape: SequenceType,
             action_space_size: int,
             num_res_blocks: int,
             num_channels: int,
-            value_head_channels: int = 1,
-            policy_head_channels: int = 2,
-            value_head_hidden_channels: List[int] = [256],
-            policy_head_hidden_channels: List[int] = [256],
-            output_support_size: int = 601,
+            value_head_channels: int,
+            policy_head_channels: int,
+            value_head_hidden_channels: List[int],
+            policy_head_hidden_channels: List[int],
+            output_support_size: int,
+            flatten_input_size_for_value_head: int,
+            flatten_input_size_for_policy_head: int,
+            downsample: bool = False,
             last_linear_layer_init_zero: bool = True,
             activation: nn.Module = nn.ReLU(inplace=True),
             norm_type: str = 'BN',
     ) -> None:
         """
         Arguments:
-            - action_space_size: (:obj:`int`): The size of the action space.
+            - observation_shape (:obj:`SequenceType`): The shape of observation space, e.g. (C, H, W).
+            - action_space_size (:obj:`int`): The size of the action space.
             - num_res_blocks (:obj:`int`): The number of residual blocks.
             - num_channels (:obj:`int`): The number of channels in the input latent state.
             - value_head_channels (:obj:`int`): Channels for the value head's convolutional layer.
@@ -1085,19 +1090,22 @@ class PredictionNetwork(nn.Module):
             - value_head_hidden_channels (:obj:`List[int]`): Hidden layer sizes for the value MLP head.
             - policy_head_hidden_channels (:obj:`List[int]`): Hidden layer sizes for the policy MLP head.
             - output_support_size (:obj:`int`): The size of the categorical value distribution.
+            - flatten_input_size_for_value_head (:obj:`int`): The flattened input size for the value head.
+            - flatten_input_size_for_policy_head (:obj:`int`): The flattened input size for the policy head.
+            - downsample (:obj:`bool`): Whether the observation is downsampled.
             - last_linear_layer_init_zero (:obj:`bool`): Whether to initialize the last layer of heads to zero.
             - activation (:obj:`nn.Module`): The activation function.
             - norm_type (:obj:`str`): The normalization type ('BN' or 'LN').
         """
         super().__init__()
-        if norm_type not in ['BN', 'LN']:
-            raise ValueError(f"Unsupported norm_type: {norm_type}. Must be 'BN' or 'LN'.")
+        self.observation_shape = observation_shape
+        self.downsample = downsample
 
         self.resblocks = nn.ModuleList([
             ResBlock(in_channels=num_channels, activation=activation, norm_type=norm_type, res_type='basic', bias=False)
             for _ in range(num_res_blocks)
         ])
-        
+
         self.conv1x1_value = nn.Conv2d(num_channels, value_head_channels, 1)
         self.conv1x1_policy = nn.Conv2d(num_channels, policy_head_channels, 1)
 
@@ -1105,16 +1113,8 @@ class PredictionNetwork(nn.Module):
         self.norm_policy = build_normalization(norm_type, dim=2)(policy_head_channels)
         self.activation = activation
 
-        # The input size for the MLP heads depends on the spatial dimensions of the latent state.
-        # This must be pre-calculated and passed correctly.
-        # Example: for a 6x6 latent space, flatten_input_size = channels * 6 * 6
-        # We assume the user will provide these values.
-        # Here we just define placeholder attributes.
-        self._flatten_input_size_for_value_head = None
-        self._flatten_input_size_for_policy_head = None
-
         self.fc_value = MLP_V2(
-            in_channels=-1, # Placeholder, will be determined at first forward pass
+            in_channels=flatten_input_size_for_value_head,
             hidden_channels=value_head_hidden_channels,
             out_channels=output_support_size,
             activation=activation,
@@ -1124,7 +1124,7 @@ class PredictionNetwork(nn.Module):
             last_linear_layer_init_zero=last_linear_layer_init_zero
         )
         self.fc_policy = MLP_V2(
-            in_channels=-1, # Placeholder
+            in_channels=flatten_input_size_for_policy_head,
             hidden_channels=policy_head_hidden_channels,
             out_channels=action_space_size,
             activation=activation,
@@ -1146,18 +1146,9 @@ class PredictionNetwork(nn.Module):
 
         value_feat = self.activation(self.norm_value(self.conv1x1_value(latent_state)))
         policy_feat = self.activation(self.norm_policy(self.conv1x1_policy(latent_state)))
-        
+
         value_flat = value_feat.view(value_feat.size(0), -1)
         policy_flat = policy_feat.view(policy_feat.size(0), -1)
-
-        # Dynamically initialize in_channels on the first forward pass
-        if self.fc_value.in_channels == -1:
-            self.fc_value[0].in_features = value_flat.shape[1]
-            self.fc_policy[0].in_features = policy_flat.shape[1]
-            # PyTorch lazy modules handle this better, but this is a manual way.
-            self.fc_value[0].weight.data.uniform_(-math.sqrt(1/value_flat.shape[1]), math.sqrt(1/value_flat.shape[1]))
-            self.fc_policy[0].weight.data.uniform_(-math.sqrt(1/policy_flat.shape[1]), math.sqrt(1/policy_flat.shape[1]))
-
 
         value = self.fc_value(value_flat)
         policy_logits = self.fc_policy(policy_flat)

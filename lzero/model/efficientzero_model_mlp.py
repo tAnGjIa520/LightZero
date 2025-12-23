@@ -106,7 +106,7 @@ class EfficientZeroModelMLP(nn.Module):
         self.res_connection_in_dynamics = res_connection_in_dynamics
 
         self.representation_network = RepresentationNetworkMLP(
-            observation_shape=observation_shape, hidden_channels=latent_state_dim, norm_type=norm_type
+            observation_dim=observation_shape, hidden_channels=latent_state_dim, norm_type=norm_type
         )
 
         self.dynamics_network = DynamicsNetworkMLP(

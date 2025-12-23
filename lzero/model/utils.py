@@ -317,3 +317,57 @@ def set_gradients(model: nn.Module, gradients: List[Optional[torch.Tensor]]) -> 
         if g is not None:
             # Ensure the gradient is on the same device as the parameter.
             p.grad = g.to(p.device)
+
+
+def get_dynamic_mean(model: nn.Module) -> float:
+    """
+    Overview:
+        Calculates the mean of absolute values of parameters in the dynamics network (resblocks).
+        This is used to monitor the parameter magnitude in the dynamics part of the model.
+
+    Arguments:
+        - model (:obj:`nn.Module`): The dynamics network model that contains resblocks.
+
+    Returns:
+        - float: The mean absolute value of parameters in the resblocks.
+    """
+    num_weights = 0
+    device = next(model.parameters()).device
+    sum_weight_magnitude = torch.tensor(0.0, device=device)
+
+    if hasattr(model, 'resblocks'):
+        for block in model.resblocks:
+            for p in block.parameters():
+                num_weights += p.numel()
+                sum_weight_magnitude += torch.sum(torch.abs(p))
+
+    if num_weights == 0:
+        return 0.0
+    return sum_weight_magnitude.cpu().item() / num_weights
+
+
+def get_reward_mean(model: nn.Module) -> Tuple[np.ndarray, float]:
+    """
+    Overview:
+        Calculates the mean of absolute values of parameters in the reward prediction head.
+        Returns both the raw weights array and the mean value.
+
+    Arguments:
+        - model (:obj:`nn.Module`): The dynamics network model that contains fc_reward_head.
+
+    Returns:
+        - Tuple[np.ndarray, float]: A tuple containing the flattened weights array and their mean absolute value.
+    """
+    weights_list = []
+
+    if hasattr(model, 'fc_reward_head'):
+        for p in model.fc_reward_head.parameters():
+            weights_list.append(p.detach().cpu().numpy().flatten())
+
+    if not weights_list:
+        return np.array([]), 0.0
+
+    all_weights = np.concatenate(weights_list)
+    mean_val = np.mean(np.abs(all_weights))
+
+    return all_weights, mean_val
