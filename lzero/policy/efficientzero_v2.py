@@ -10,7 +10,7 @@ from ding.utils import POLICY_REGISTRY
 from torch.distributions import Categorical
 from torch.nn import L1Loss
 
-from lzero.mcts import EfficientZeroMCTSCtree as MCTSCtree
+from lzero.mcts import EZV2MCTSCtree as MCTSCtree
 from lzero.mcts import EfficientZeroMCTSPtree as MCTSPtree
 from lzero.model import ImageTransforms
 from lzero.policy import scalar_transform, InverseScalarTransform, cross_entropy_loss, phi_transform, \
@@ -20,8 +20,8 @@ from lzero.policy import scalar_transform, InverseScalarTransform, cross_entropy
 from lzero.policy.muzero import MuZeroPolicy
 
 
-@POLICY_REGISTRY.register('efficientzero')
-class EfficientZeroPolicy(MuZeroPolicy):
+@POLICY_REGISTRY.register('efficientzero_v2')
+class EfficientZeroV2Policy(MuZeroPolicy):
     """
     Overview:
         The policy class for EfficientZero proposed in the paper https://arxiv.org/abs/2111.00210.
@@ -67,7 +67,7 @@ class EfficientZeroPolicy(MuZeroPolicy):
         # this variable is used in ``collector``.
         sampled_algo=False,
         # (bool) Whether to enable the gumbel-based algorithm (e.g. Gumbel Muzero)
-        gumbel_algo=False,
+        gumbel_algo=True,
         # (bool) Whether to use C++ MCTS in policy. If False, use Python implementation.
         mcts_ctree=True,
         # (bool) Whether to use cuda for network.
@@ -296,11 +296,14 @@ class EfficientZeroPolicy(MuZeroPolicy):
             - info_dict (:obj:`Dict[str, Union[float, int]]`): The information dict to be logged, which contains \
                 current learning loss and learning statistics.
         """
+        # import pudb;pudb.set_trace()
         self._learn_model.train()
         self._target_model.train()
+
         current_batch, target_batch = data
         obs_batch_ori, action_batch, mask_batch, indices, weights, make_time = current_batch
-        target_value_prefix, target_value, target_policy = target_batch
+        # EfficientZero V2: unpack search_values for value mixing
+        target_value_prefix, target_value, target_policy, target_search_value = target_batch
 
         obs_batch, obs_target_batch = prepare_obs(obs_batch_ori, self._cfg)
 
@@ -315,14 +318,43 @@ class EfficientZeroPolicy(MuZeroPolicy):
         data_list = [
             mask_batch,
             target_value_prefix.astype('float32'),
-            target_value.astype('float32'), target_policy, weights
+            target_value.astype('float32'), target_policy, weights,
+            target_search_value.astype('float32')  # EfficientZero V2: search values
         ]
         [mask_batch, target_value_prefix, target_value, target_policy,
-         weights] = to_torch_float_tensor(data_list, self._cfg.device)
+         weights, target_search_value] = to_torch_float_tensor(data_list, self._cfg.device)
 
         target_value_prefix = target_value_prefix.view(self._cfg.batch_size, -1)
         target_value = target_value.view(self._cfg.batch_size, -1)
+        target_search_value = target_search_value.view(self._cfg.batch_size, -1)  # EfficientZero V2
         assert obs_batch.size(0) == self._cfg.batch_size == target_value_prefix.size(0)
+
+        # ==============================================================
+        # EfficientZero V2: Value Target Mixing
+        # ==============================================================
+        # Get value target type from config
+        value_target_type = getattr(self._cfg, 'value_target', 'bootstrap')  # 'bootstrap', 'search', 'mixed'
+
+        if value_target_type == 'mixed':
+            # Get the threshold for starting to use mixed values
+            start_use_mix_steps = getattr(self._cfg, 'start_use_mix_training_steps', 30000)
+
+            if self._train_iteration < start_use_mix_steps:
+                # Early training: use bootstrap only
+                final_target_value = target_value
+            else:
+                # Later training: mix bootstrap and search
+                # Use a simple equal mixing (can be adjusted)
+                final_target_value = 0.5 * target_value + 0.5 * target_search_value
+        elif value_target_type == 'search':
+            # Use search values only
+            final_target_value = target_search_value
+        else:
+            # Default: use bootstrap values only
+            final_target_value = target_value
+
+        # Use the final mixed target value for all subsequent computations
+        target_value = final_target_value
 
         # ``scalar_transform`` to transform the original value to the scaled value,
         # i.e. h(.) function in paper https://arxiv.org/pdf/1805.11593.pdf.
@@ -376,7 +408,7 @@ class EfficientZeroPolicy(MuZeroPolicy):
         else:
             # Set target_policy_entropy to log(|A|) if all rows are masked
             target_policy_entropy = torch.log(torch.tensor(target_normalized_visit_count_init_step.shape[-1]))
-
+        
         value_loss = cross_entropy_loss(value, target_value_categorical[:, 0])
 
         value_prefix_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
@@ -576,6 +608,7 @@ class EfficientZeroPolicy(MuZeroPolicy):
             ready_env_id = np.arange(active_collect_env_num)
         output = {i: None for i in ready_env_id}
 
+        
         with torch.no_grad():
             # data shape [B, S x C, W, H], e.g. {Tensor:(B, 12, 96, 96)}
             network_output = self._collect_model.initial_inference(data)
@@ -589,17 +622,19 @@ class EfficientZeroPolicy(MuZeroPolicy):
                 reward_hidden_state_roots[0].detach().cpu().numpy(),
                 reward_hidden_state_roots[1].detach().cpu().numpy()
             )
+            
             policy_logits = policy_logits.detach().cpu().numpy().tolist()
 
             legal_actions = [[i for i, x in enumerate(action_mask[j]) if x == 1] for j in range(active_collect_env_num)]
-
             # if abs(sum(policy_logits[0]))>0.02:
+            
             
             if not self._cfg.collect_with_pure_policy:
                 # collect with MCTS guided with policy.
-                noises = [
-                    np.random.dirichlet([self._cfg.root_dirichlet_alpha] * int(sum(action_mask[j]))
-                                        ).astype(np.float32).tolist() for j in range(active_collect_env_num)
+                # Generate Gumbel noises for EfficientZero V2 Sequential Halving
+                gumbel_noises = [
+                    np.random.gumbel(0, 1, int(sum(action_mask[j]))).astype(np.float32)*self._cfg.root_noise_weight
+                    for j in range(active_collect_env_num)
                 ]
                 if self._cfg.mcts_ctree:
                     # cpp mcts_tree
@@ -607,41 +642,46 @@ class EfficientZeroPolicy(MuZeroPolicy):
                 else:
                     # python mcts_tree
                     roots = MCTSPtree.roots(active_collect_env_num, legal_actions)
-                roots.prepare(self._cfg.root_noise_weight, noises, value_prefix_roots, policy_logits, to_play)
-                self._mcts_collect.search(
-                    roots, self._collect_model, latent_state_roots, reward_hidden_state_roots, to_play
+                # roots.prepare_no_noise(self._cfg.root_noise_weight, noises, value_prefix_roots, policy_logits, to_play)
+                roots.prepare_no_noise(value_prefix_roots, policy_logits, to_play)
+                # EfficientZero V2: search returns improved_policies and best_actions
+                improved_policies, best_actions = self._mcts_collect.search(
+                    roots, self._collect_model, latent_state_roots, reward_hidden_state_roots, to_play, gumbel_noises
                 )
-
                 roots_visit_count_distributions = roots.get_distributions()
                 roots_values = roots.get_values()  # shape: {list: batch_size}
 
                 for i, env_id in enumerate(ready_env_id):
-                    distributions, value = roots_visit_count_distributions[i], roots_values[i]
+                    # EfficientZero V2: use improved_policy and best_action
+                    improved_policy = improved_policies[i]
+                    best_action_idx = best_actions[i]
+                    value = roots_values[i]
+                    distributions=roots_visit_count_distributions[i]
+                    # EfficientZero V2: greedy action selection (Sequential Halving best action)
+                    action_index_in_legal_action_set = best_action_idx
+
                     if self._cfg.eps.eps_greedy_exploration_in_collect:
-                        # eps-greedy collect
-                        action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
-                            distributions, temperature=self._collect_mcts_temperature, deterministic=True
-                        )
-                        action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
+                        # eps-greedy exploration
                         if np.random.rand() < self.collect_epsilon:
-                            action = np.random.choice(legal_actions[i])
-                    else:
-                        # normal collect
-                        # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
-                        # the index within the legal action set, rather than the index in the entire action set.
-                        action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
-                            distributions, temperature=self._collect_mcts_temperature, deterministic=False
-                        )
-                        # NOTE: Convert the ``action_index_in_legal_action_set`` to the corresponding ``action`` in the entire action set.
-                        action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
-                        # import pudb;pudb.set_trasce()
+                            action_index_in_legal_action_set = np.random.choice(len(legal_actions[i]))
+
+                    # Compute improved policy entropy for logging
+                    visit_count_distribution_entropy = -np.sum(
+                        improved_policy * np.log(improved_policy + 1e-9)
+                    )
+
+                    # NOTE: Convert the ``action_index_in_legal_action_set`` to the corresponding ``action`` in the entire action set.
+                    action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
+                    # import pudb;pudb.set_trace()
                     output[env_id] = {
                         'action': action,
-                        'visit_count_distributions': distributions,
+                        'visit_count_distributions': distributions,#improved_policy,  # EfficientZero V2: improved policy
                         'visit_count_distribution_entropy': visit_count_distribution_entropy,
                         'searched_value': value,
                         'predicted_value': pred_values[i],
                         'predicted_policy_logits': policy_logits[i],
+                        "improved_policy_probs":improved_policy,
+                        "roots_completed_value":value
                     }
             else:
                 # collect with pure policy.
@@ -721,25 +761,38 @@ class EfficientZeroPolicy(MuZeroPolicy):
                 # python mcts_tree
                 roots = MCTSPtree.roots(active_eval_env_num, legal_actions)
             roots.prepare_no_noise(value_prefix_roots, policy_logits, to_play)
-            self._mcts_eval.search(roots, self._eval_model, latent_state_roots, reward_hidden_state_roots, to_play)
+            # Generate zero Gumbel noises for evaluation (no exploration)
+            gumbel_noises = [
+                np.zeros(int(sum(action_mask[j])), dtype=np.float32)
+                for j in range(active_eval_env_num)
+            ]
+            # EfficientZero V2: search returns improved_policies and best_actions
+            improved_policies, best_actions = self._mcts_eval.search(
+                roots, self._eval_model, latent_state_roots, reward_hidden_state_roots, to_play, gumbel_noises
+            )
 
-            # list of list, shape: ``{list: batch_size} -> {list: action_space_size}``
-            roots_visit_count_distributions = roots.get_distributions()
             roots_values = roots.get_values()  # shape: {list: batch_size}
 
             for i, env_id in enumerate(ready_env_id):
-                distributions, value = roots_visit_count_distributions[i], roots_values[i]
-                # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
-                # the index within the legal action set, rather than the index in the entire action set.
-                #  Setting deterministic=True implies choosing the action with the highest value (argmax) rather than sampling during the evaluation phase.
-                action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
-                    distributions, temperature=1, deterministic=True
+                # EfficientZero V2: use improved_policy and best_action
+                improved_policy = improved_policies[i]
+                best_action_idx = best_actions[i]
+                value = roots_values[i]
+
+                # EfficientZero V2: greedy action selection (Sequential Halving best action)
+                # Eval mode: always use best action (deterministic=True)
+                action_index_in_legal_action_set = best_action_idx
+
+                # Compute improved policy entropy for logging
+                visit_count_distribution_entropy = -np.sum(
+                    improved_policy * np.log(improved_policy + 1e-9)
                 )
+
                 # NOTE: Convert the ``action_index_in_legal_action_set`` to the corresponding ``action`` in the entire action set.
                 action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
                 output[env_id] = {
                     'action': action,
-                    'visit_count_distributions': distributions,
+                    'visit_count_distributions': improved_policy,  # EfficientZero V2: improved policy
                     'visit_count_distribution_entropy': visit_count_distribution_entropy,
                     'searched_value': value,
                     'predicted_value': pred_values[i],
