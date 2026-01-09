@@ -86,6 +86,10 @@ class MuZeroCollector(ISerialCollector):
         self.policy_config = policy_config
         self.collect_with_pure_policy = self.policy_config.collect_with_pure_policy
 
+        # PPO configuration (required)
+        self.ppo_gamma = policy_config.ppo.gamma
+        self.ppo_gae_lambda = policy_config.ppo.gae_lambda
+
         self.reset(policy, env)
 
     def reset_env(self, _env: Optional[BaseEnvManager] = None) -> None:
@@ -154,6 +158,9 @@ class MuZeroCollector(ISerialCollector):
         # A game_segment_pool implementation based on the deque structure.
         self.game_segment_pool = deque(maxlen=int(1e6))
         self.unroll_plus_td_steps = self.policy_config.num_unroll_steps + self.policy_config.td_steps
+
+        # Global episode_id counter for tracking segments belonging to the same episode
+        self._global_episode_id = 0
 
     def _reset_stat(self, env_id: int) -> None:
         """
@@ -318,7 +325,7 @@ class MuZeroCollector(ISerialCollector):
                 n_episode: Optional[int] = None,
                 train_iter: int = 0,
                 policy_kwargs: Optional[dict] = None,
-                collect_with_pure_policy: bool = False) -> List[Any]:
+                collect_with_pure_policy: bool = True) -> List[Any]:
         """
         Overview:
             Collect `n_episode` episodes of data with policy_kwargs, trained for `train_iter` iterations.
@@ -389,6 +396,10 @@ class MuZeroCollector(ISerialCollector):
                 maxlen=self.policy_config.model.frame_stack_num
             )
             game_segments[env_id].reset(observation_window_stack[env_id])
+            
+            # Set initial episode_id for each game segment
+            game_segments[env_id].episode_id = self._global_episode_id
+            self._global_episode_id += 1
 
         dones = np.array([False for _ in range(env_nums)])
         last_game_segments = [None for _ in range(env_nums)]
@@ -460,6 +471,26 @@ class MuZeroCollector(ISerialCollector):
                 timestep_dict_with_env_id = {
                         k: v['timestep'] if 'timestep' in v else -1 for k, v in policy_output.items()
                 }
+                # PPO: calculate log_prob from policy_logits and action
+                # Use predicted_policy_logits to compute log probability of the selected action
+                log_prob_dict_with_env_id = {}
+                for k, v in policy_output.items():
+                    if 'log_prob' in v:
+                        # If log_prob is already provided, use it directly
+                        log_prob_dict_with_env_id[k] = v['log_prob']
+                    elif 'predicted_policy_logits' in v:
+                        # Compute log_prob from policy_logits: log(softmax(logits)[action])
+                        policy_logits = np.array(v['predicted_policy_logits'])
+                        action = v['action']
+                        # Apply softmax to get probabilities (with numerical stability)
+                        exp_logits = np.exp(policy_logits - np.max(policy_logits))
+                        probs = exp_logits / (np.sum(exp_logits) + 1e-8)
+                        # Get log probability of the selected action
+                        log_prob = np.log(probs[action] + 1e-8)
+                        log_prob_dict_with_env_id[k] = float(log_prob)
+                    else:
+                        # Fallback: if no policy_logits available, set to 0.0
+                        log_prob_dict_with_env_id[k] = 0.0
 
                 if self.policy_config.sampled_algo:
                     root_sampled_actions_dict_with_env_id = {
@@ -483,6 +514,7 @@ class MuZeroCollector(ISerialCollector):
                 pred_value_dict = {}
                 timestep_dict = {}
                 pred_next_text = {}
+                log_prob_dict = {}  # PPO: log_prob dictionary
 
                 if not collect_with_pure_policy:
                     distributions_dict = {}
@@ -502,6 +534,7 @@ class MuZeroCollector(ISerialCollector):
                     pred_value_dict[env_id] = pred_value_dict_with_env_id.pop(env_id)
                     timestep_dict[env_id] = timestep_dict_with_env_id.pop(env_id)
                     pred_next_text[env_id] = pred_next_text_with_env_id.pop(env_id)
+                    log_prob_dict[env_id] = log_prob_dict_with_env_id.pop(env_id)  # PPO: populate log_prob
 
                     if not collect_with_pure_policy:
                         distributions_dict[env_id] = distributions_dict_with_env_id.pop(env_id)
@@ -561,6 +594,9 @@ class MuZeroCollector(ISerialCollector):
                                                                      improved_policy=improved_policy_dict[env_id])
                         else:
                             game_segments[env_id].store_search_stats(distributions_dict[env_id], value_dict[env_id])
+                    
+                    # PPO: store log_prob for PPO training
+                    game_segments[env_id].old_log_prob_segment.append(log_prob_dict[env_id])
 
                     # append a transition tuple, including a_t, o_{t+1}, r_{t}, action_mask_{t}, to_play_{t}
                     # in ``game_segments[env_id].init``, we have appended o_{t} in ``self.obs_segment``
@@ -640,6 +676,9 @@ class MuZeroCollector(ISerialCollector):
                             config=self.policy_config
                         )
                         game_segments[env_id].reset(observation_window_stack[env_id])
+                        
+                        # Inherit episode_id from the previous segment (same episode)
+                        game_segments[env_id].episode_id = last_game_segments[env_id].episode_id
 
                     self._env_info[env_id]['step'] += 1
                     if "world_model_cfg" in self.policy_config.model and self.policy_config.model.world_model_cfg.obs_type == 'text':
@@ -733,6 +772,10 @@ class MuZeroCollector(ISerialCollector):
                         game_segments[env_id].reset(observation_window_stack[env_id])
                         last_game_segments[env_id] = None
                         last_game_priorities[env_id] = None
+                        
+                        # New episode starts, assign new episode_id
+                        game_segments[env_id].episode_id = self._global_episode_id
+                        self._global_episode_id += 1
 
                     # log
                     self_play_moves_max = max(self_play_moves_max, eps_steps_lst[env_id])
@@ -752,6 +795,9 @@ class MuZeroCollector(ISerialCollector):
                     ready_env_id.remove(env_id)
 
             if collected_episode >= n_episode:
+                # Batch compute GAE for all episodes in the pool
+                self._batch_compute_gae_for_pool()
+                
                 # [data, meta_data]
                 return_data = [self.game_segment_pool[i][0] for i in range(len(self.game_segment_pool))], [
                     {
@@ -841,3 +887,88 @@ class MuZeroCollector(ISerialCollector):
 
             if self.policy_config.use_wandb:
                 wandb.log({'{}_step/'.format(self._instance_name) + k: v for k, v in info.items()}, step=self._total_envstep_count)
+
+    def _batch_compute_gae_for_pool(self) -> None:
+        """
+        Overview:
+            Batch compute GAE (Generalized Advantage Estimation) for all segments in game_segment_pool
+            at the end of collect. Process by grouping segments by episode_id.
+        """
+        if len(self.game_segment_pool) == 0:
+            return
+        
+        gamma = self.ppo_gamma
+        gae_lambda = self.ppo_gae_lambda
+        
+        # 1. Group all segments by episode_id
+        episode_groups = {}  # {episode_id: [(pool_idx, segment, priorities, done), ...]}
+        
+        for pool_idx in range(len(self.game_segment_pool)):
+            segment, priorities, done_flag = self.game_segment_pool[pool_idx]
+            episode_id = segment.episode_id
+            
+            if episode_id not in episode_groups:
+                episode_groups[episode_id] = []
+            episode_groups[episode_id].append((pool_idx, segment, priorities, done_flag))
+        
+        # 2. Compute GAE for each episode
+        for episode_id, segments_info in episode_groups.items():
+            # Sort by pool_idx to ensure temporal order
+            segments_info.sort(key=lambda x: x[0])
+            
+            # Extract values and rewards for the entire episode
+            all_values = []
+            all_rewards = []
+            segment_lengths = []
+            
+            for pool_idx, segment, _, _ in segments_info:
+                seg_len = len(segment.action_segment)
+                segment_lengths.append(seg_len)
+                
+                # Extract values and rewards from this segment
+                values = segment.root_value_segment[:seg_len]
+                rewards = segment.reward_segment[:seg_len]
+                
+                all_values.extend(values)
+                all_rewards.extend(rewards)
+            
+            # Convert to numpy arrays
+            all_values = np.array(all_values, dtype=np.float32)
+            all_rewards = np.array(all_rewards, dtype=np.float32)
+            
+            # Compute GAE from back to front
+            advantages = np.zeros_like(all_rewards, dtype=np.float32)
+            returns = np.zeros_like(all_rewards, dtype=np.float32)  # PPO: compute return simultaneously
+            gae = 0.0
+            
+            for t in reversed(range(len(all_rewards))):
+                # Get next value
+                if t == len(all_rewards) - 1:
+                    next_value = 0.0  # Episode end
+                else:
+                    next_value = all_values[t + 1]
+                
+                # TD error: δ_t = r_t + γ*V(s_{t+1}) - V(s_t)
+                delta = all_rewards[t] + gamma * next_value - all_values[t]
+                
+                # GAE: A_t = δ_t + γ*λ*A_{t+1}
+                gae = delta + gamma * gae_lambda * gae
+                advantages[t] = gae
+                
+                # PPO: Return = Advantage + Value
+                returns[t] = gae + all_values[t]
+            
+            # 3. Distribute advantages and returns back to segments
+            offset = 0
+            for i, (pool_idx, segment, priorities, done_flag) in enumerate(segments_info):
+                seg_len = segment_lengths[i]
+                
+                # Assign advantages and returns
+                segment.advantage_segment = advantages[offset:offset + seg_len].copy()
+                segment.return_segment = returns[offset:offset + seg_len].copy()  # PPO: assign returns
+                offset += seg_len
+                
+                # Update segment in pool
+                self.game_segment_pool[pool_idx] = (segment, priorities, done_flag)
+        
+        self._logger.info(f"Batch computed GAE for {len(episode_groups)} episodes in game_segment_pool")

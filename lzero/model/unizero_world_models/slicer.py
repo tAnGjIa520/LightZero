@@ -85,7 +85,11 @@ class Head(Slicer):
             x_sliced = [x[i, self.compute_slice(num_steps, prev_steps[i].item())] for i in range(prev_steps.shape[0])]
             x_sliced = torch.cat(x_sliced, dim=0)
         elif isinstance(prev_steps, int):
-            x_sliced = x[:, self.compute_slice(num_steps, prev_steps)]  # x is (B, T, E)
+            # import pudb;pudb.set_trace()
+            try:
+                x_sliced = x[:, self.compute_slice(num_steps, prev_steps)]  # x is (B, T, E)
+            except:
+                import pudb;pudb.set_trace()
         return self.head_module(x_sliced)
 
 

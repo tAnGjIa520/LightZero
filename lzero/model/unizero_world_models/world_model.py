@@ -621,8 +621,9 @@ class WorldModel(nn.Module):
         x = self._transformer_pass(
             sequences, past_keys_values, kvcache_independent, valid_context_lengths, start_pos=start_pos_adjusted
         )
-
+        
         # Generate logits for various components.
+        # import pudb;pudb.set_traces()
         logits_observations = self.head_observations(x, num_steps=num_steps, prev_steps=prev_steps)
         logits_rewards = self.head_rewards(x, num_steps=num_steps, prev_steps=prev_steps)
         logits_policy = self.head_policy(x, num_steps=num_steps, prev_steps=prev_steps)
@@ -778,8 +779,9 @@ class WorldModel(nn.Module):
             outputs_wm = self.wm_forward_for_initial_infererence(obs_embeddings, batch_action,
                                                                                    current_obs_embeddings, start_pos)
         else:
-            # ================ calculate the target value in Train phase or calculate the target policy in reanalyze phase ================
+            # ================ calculate ‘the target value in Train phase or calculate the target policy in reanalyze phase ================
             self.latent_state = obs_embeddings
+            # import pudb;pudb.set_trace()
             outputs_wm = self.wm_forward_for_initial_infererence(obs_embeddings, batch_action, None, start_pos)
 
         return outputs_wm, self.latent_state
@@ -789,81 +791,111 @@ class WorldModel(nn.Module):
                                                              batch_action=None,
                                                              current_obs_embeddings=None, start_pos: int = 0) -> torch.FloatTensor:
         """
-        Refresh key-value pairs with the initial latent state for inference.
+        在初始推理阶段刷新键值对缓存 (KV Cache)。
+
+        KV Cache 机制详解:
+        ==================
+        1. **目的**: 避免重复计算 Transformer 的注意力键值对，提高推理效率
+        2. **核心思想**: 相同的潜在状态对应相同的键值对，可以直接复用
+        3. **多环境支持**: 每个环境维护独立的缓存状态，支持并行推理
+        4. **缓存层次**:
+           - shared_pool_init_infer: 初始推理阶段的共享缓存池 (按环境分组)
+           - shared_pool_recur_infer: 递归推理阶段的共享缓存池 (全局)
+           - past_kv_cache_init_infer_envs: 状态哈希到缓存索引的映射表
 
         Arguments:
-            - last_obs_embeddings (:obj:`torch.LongTensor`): The latent state embeddings.
-            - batch_action (optional): Actions taken.
-            - current_obs_embeddings (optional): Current observation embeddings.
+            - last_obs_embeddings (:obj:`torch.LongTensor`): 上一步的潜在状态嵌入
+            - batch_action (optional): 执行的动作
+            - current_obs_embeddings (optional): 当前观察的嵌入
         Returns:
-            - torch.FloatTensor: The outputs from the world model.
+            - torch.FloatTensor: 世界模型的输出
         """
         n, num_observations_tokens, _ = last_obs_embeddings.shape
+
+        # import pudb;pudb.set_trace()
+
         if n <= self.env_num and current_obs_embeddings is not None:
-            # ================ Collect and Evaluation Phase ================
+            # ================ 收集和评估阶段 ================
             if current_obs_embeddings is not None:
-                 # Determine whether it is the first step in an episode.
+                 # 判断是否为 episode 的第一步
+
+                # if -1 in batch_action:
+                #     import pudb;pudb.set_trace()
+
                 if self.continuous_action_space:
                     first_step_flag = not isinstance(batch_action[0], np.ndarray)
                 else:
+                    # import pudb;pudb.set_trace()
                     first_step_flag = max(batch_action) == -1
                 if first_step_flag:
-                    # ------------------------- First Step of an Episode -------------------------
+                    # ------------------------- Episode 第一步：初始化 KV Cache -------------------------
+                    # 为当前批次的所有环境生成空的 KV Cache
+                    # keys_values_wm 是全局的多环境 KV Cache，存储所有环境的键值对
                     self.keys_values_wm = self.transformer.generate_empty_keys_values(n=current_obs_embeddings.shape[0],
                                                                                       max_tokens=self.context_length)
                     # print(f"current_obs_embeddings.device: {current_obs_embeddings.device}")
+
+                    # 使用当前观察嵌入进行前向传播，同时更新 KV Cache
                     outputs_wm = self.forward({'obs_embeddings': current_obs_embeddings},
                                               past_keys_values=self.keys_values_wm, is_init_infer=True, start_pos=start_pos)
 
-                    # Copy and store keys_values_wm for a single environment
+                    # 将更新后的 KV Cache 复制并存储到单环境缓存池中，用于后续的缓存查找
                     self.update_cache_context(current_obs_embeddings, is_init_infer=True)
                 else:
-                    # --------------------- Continuing an Episode (Multi-environment) ---------------------
-                    # current_obs_embeddings is the new latent_state, containing information from ready_env_num environments
+                    # --------------------- Episode 继续步骤：KV Cache 查找与复用 ---------------------
+                    # current_obs_embeddings 是新的潜在状态，包含来自 ready_env_num 个环境的信息
                     ready_env_num = current_obs_embeddings.shape[0]
-                    self.keys_values_wm_list = []
-                    self.keys_values_wm_size_list = []
+                    self.keys_values_wm_list = []  # 存储每个环境的 KV Cache
+                    self.keys_values_wm_size_list = []  # 存储每个环境的 KV Cache 大小
 
                     for i in range(ready_env_num):
-                        # Retrieve latent state for a single environment
+                        # 获取单个环境的潜在状态
                         # TODO: len(last_obs_embeddings) may smaller than len(current_obs_embeddings), because some environments may have done
 
                         state_single_env = last_obs_embeddings[i]
-                        # Compute hash value using latent state for a single environment
+                        # 使用潜在状态计算哈希值作为缓存键
+                        # 这是 KV Cache 查找的关键：相同状态对应相同的缓存
                         cache_key = hash_state(state_single_env.view(-1).cpu().numpy())  # last_obs_embeddings[i] is torch.Tensor
 
-                        # Retrieve cached value
+                        # 从初始推理缓存池中检索缓存值
+                        # past_kv_cache_init_infer_envs[i] 是第 i 个环境的缓存字典：{状态哈希 -> 缓存索引}
                         cache_index = self.past_kv_cache_init_infer_envs[i].get(cache_key)
                         if cache_index is not None:
+                            # 如果找到缓存索引，从共享池中获取对应的 KV Cache
                             matched_value = self.shared_pool_init_infer[i][cache_index]
                         else:
                             matched_value = None
 
+                        # 统计缓存查询次数（用于性能分析）
                         self.root_total_query_cnt += 1
                         if matched_value is not None:
-                            # If a matching value is found, add it to the list
+                            # ========== KV Cache 命中：复用已有的键值对 ==========
                             self.root_hit_cnt += 1
-                            # NOTE: deepcopy is needed because forward modifies matched_value in place
+                            # 注意：需要深拷贝，因为 forward 会就地修改 matched_value
+                            # custom_copy_kv_cache_to_shared_wm 将缓存复制到世界模型共享池
                             self.keys_values_wm_list.append(self.custom_copy_kv_cache_to_shared_wm(matched_value))
                             self.keys_values_wm_size_list.append(matched_value.size)
                         else:
-                            # Reset using zero values
+                            # ========== KV Cache 未命中：重新计算 ==========
+                            # 生成空的单环境 KV Cache
                             self.keys_values_wm_single_env = self.transformer.generate_empty_keys_values(n=1, max_tokens=self.context_length)
-                            # If using RoPE positional encoding, then at reset, the pos_embed should use the absolute position start_pos[i].
+                            # 如果使用 RoPE 位置编码，重置时位置嵌入应使用绝对位置 start_pos[i]
                             outputs_wm = self.forward({'obs_embeddings': state_single_env.unsqueeze(0)},
                                                       past_keys_values=self.keys_values_wm_single_env,
                                                       is_init_infer=True, start_pos=start_pos[i].item())
                             self.keys_values_wm_list.append(self.keys_values_wm_single_env)
                             self.keys_values_wm_size_list.append(1)
 
-                    # Input self.keys_values_wm_list, output self.keys_values_wm
+                    # ========== KV Cache 批处理：统一大小并合并 ==========
+                    # 将多个环境的 KV Cache 统一大小并合并为批处理格式
+                    # trim_and_pad_kv_cache 确保所有环境的缓存具有相同的序列长度，便于批处理
                     self.keys_values_wm_size_list_current = self.trim_and_pad_kv_cache(is_init_infer=True)
 
                     start_pos = start_pos[:ready_env_num]
                     # TODO: len(last_obs_embeddings) may smaller than len(current_obs_embeddings), because some environments may have done
                     # TODO: the order may be not correct?  len(batch_action) may smaller than len(current_obs_embeddings), because some environments may have done
                     batch_action = batch_action[:ready_env_num]
-                    
+
                     # TODO: only for debug
                     # if ready_env_num < self.env_num:
                     #     print(f'init inference ready_env_num: {ready_env_num} < env_num: {self.env_num}')
@@ -874,17 +906,23 @@ class WorldModel(nn.Module):
                     #     print(f"len(batch_action): {len(batch_action)}")
                     #     print(f"len(current_obs_embeddings): {len(current_obs_embeddings)}")
 
+
                     if self.continuous_action_space:
                         act_tokens = torch.from_numpy(np.array(batch_action)).to(last_obs_embeddings.device).unsqueeze(1)
                     else:
-                        act_tokens = torch.from_numpy(np.array(batch_action)).to(last_obs_embeddings.device).unsqueeze(-1)
-                    
+                        act_tokens = torch.tensor(batch_action, dtype=torch.long, device=last_obs_embeddings.device).unsqueeze(-1)
+
+                    # ========== 两步前向传播：动作 -> 观察 ==========
+                    # 第一步：处理动作 token，更新 KV Cache
+                    # past_keys_values=self.keys_values_wm 传入之前的缓存状态
                     outputs_wm = self.forward({'act_tokens': act_tokens}, past_keys_values=self.keys_values_wm,
                                               is_init_infer=True, start_pos=start_pos)
+                    # 第二步：处理观察嵌入，继续更新 KV Cache
+                    # 此时 self.keys_values_wm 已经包含了动作的键值对信息
                     outputs_wm = self.forward({'obs_embeddings': current_obs_embeddings},
                                               past_keys_values=self.keys_values_wm, is_init_infer=True, start_pos=start_pos)
 
-                    # Copy and store keys_values_wm for a single environment
+                    # 将最新的 KV Cache 状态保存到缓存池中，供后续查找使用
                     self.update_cache_context(current_obs_embeddings, is_init_infer=True)
 
         elif batch_action is not None and current_obs_embeddings is None:
@@ -898,6 +936,8 @@ class WorldModel(nn.Module):
             if self.continuous_action_space:
                 act_tokens = batch_action
             else:
+                
+                # import pudb;pudb.set_trace()
                 act_tokens = rearrange(batch_action, 'b l -> b l 1')
 
             # select the last timestep for each sample
@@ -919,7 +959,14 @@ class WorldModel(nn.Module):
             # outputs_wm.logits_value.shape (B, H, 101) = (B*H, 101)
             outputs_wm.logits_value = rearrange(outputs_wm.logits_value, 'b t e -> (b t) e')
             outputs_wm.logits_policy = rearrange(outputs_wm.logits_policy, 'b t e -> (b t) e')
-
+        else:
+            raise ValueError(
+                f"Unhandled case in wm_forward_for_initial_infererence:\n"
+                f"  n={n}, env_num={self.env_num}\n"
+                f"  batch_action is None: {batch_action is None}\n"
+                f"  current_obs_embeddings is None: {current_obs_embeddings is None}\n"
+                f"  This should not happen. Please check the calling logic."
+            )
         return outputs_wm
 
     @torch.no_grad()
@@ -932,7 +979,9 @@ class WorldModel(nn.Module):
         Returns:
             - tuple: A tuple containing output sequence, latent state, logits rewards, logits policy, and logits value.
         """
+
         # UniZero has context in the root node
+        # import pudb;pudb.set_trace()
         outputs_wm, latent_state = self.reset_for_initial_inference(obs_act_dict, start_pos)
         self.past_kv_cache_recurrent_infer.clear()
 
@@ -1293,7 +1342,7 @@ class WorldModel(nn.Module):
                      **kwargs: Any) -> LossWithIntermediateLosses:
         start_pos = batch['timestep']
         # Encode observations into latent state representations
-        obs_embeddings = self.tokenizer.encode_to_obs_embeddings(batch['observations'])
+        obs_embeddings = self.tokenizer.encode_to_obs_embeddings(batch['observations']) # torch.Size([256, 5, 4])
 
         # ========= for visual analysis =========
         # Uncomment the lines below for visual analysis in Pong
@@ -1302,7 +1351,6 @@ class WorldModel(nn.Module):
         # Uncomment the lines below for visual analysis in visual match
         # self.plot_latent_tsne_each_and_all(obs_embeddings, suffix='visual_match_memlen1-60-15_tsne')
         # self.save_as_image_with_timestep(batch['observations'], suffix='visual_match_memlen1-60-15_tsne')
-
 
         # ========= logging for analysis =========
         if self.analysis_dormant_ratio:
@@ -1324,7 +1372,7 @@ class WorldModel(nn.Module):
         if self.continuous_action_space:
             act_tokens = batch['actions']
         else:
-            act_tokens = rearrange(batch['actions'], 'b l -> b l 1')
+            act_tokens = rearrange(batch['actions'], 'b l -> b l 1') # torch.Size([256, 5]) 
 
         # Forward pass to obtain predictions for observations, rewards, and policies
         outputs = self.forward({'obs_embeddings_and_act_tokens': (obs_embeddings, act_tokens)}, start_pos=start_pos)
@@ -1595,97 +1643,250 @@ class WorldModel(nn.Module):
                 dormant_ratio_world_model=dormant_ratio_world_model,
                 latent_state_l2_norms=latent_state_l2_norms,
             )
-
-
     def compute_loss_ppo(
-            self,
-            batch: Dict[str, torch.Tensor],
-            inverse_scalar_transform_handle,
-            clip_ratio: float,
-            value_coef: float,
-            entropy_coef: float,
-    ) -> Dict[str, torch.Tensor]:
-        """Compute PPO objectives (policy/value/entropy) for a mini-batch."""
-        policy_logits = batch['policy_logits']
-        action_mask = batch['action_mask'].bool()
-        actions = batch['actions'].long()
-        old_log_prob = batch['old_log_prob'].float()
-        advantages = batch['advantages'].float()
-        returns = batch['returns'].float()
-
-        masked_logits = policy_logits.masked_fill(~action_mask, -1e9)
-        dist = Categorical(logits=masked_logits)
-        log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
-
-        ratio = torch.exp(log_prob - old_log_prob)
+        self,
+        batch: Dict[str, torch.Tensor],
+        target_tokenizer: Tokenizer = None,
+        inverse_scalar_transform_handle=None,
+        clip_ratio: float = 0.2,
+        value_coef: float = 0.5,
+        entropy_coef: float = 0.01,
+        **kwargs: Any
+    ) -> LossWithIntermediateLosses:
+        """
+        Compute PPO losses combined with UniZero's observation and reward losses.
+        
+        Args:
+            batch: Dictionary containing batch data including PPO-specific fields:
+                - 'advantages': GAE advantages [B, T]
+                - 'old_log_prob': Old policy log probabilities [B, T]
+                - 'returns': Target returns for value function [B, T]
+            target_tokenizer: Target tokenizer for computing labels
+            inverse_scalar_transform_handle: Function to convert categorical values to scalars
+            clip_ratio: PPO clipping ratio (default: 0.2)
+            value_coef: Coefficient for value loss (default: 0.5)
+            entropy_coef: Coefficient for entropy loss (default: 0.01)
+        """
+        start_pos = batch['timestep']
+        # ========== 1. Observation encoding and forward pass (same as compute_loss) ==========
+        obs_embeddings = self.tokenizer.encode_to_obs_embeddings(batch['observations'])
+        
+        # Action tokens
+        if self.continuous_action_space:
+            act_tokens = batch['actions']
+        else:
+            act_tokens = rearrange(batch['actions'], 'b l -> b l 1')
+        
+        # Forward pass
+        outputs = self.forward({'obs_embeddings_and_act_tokens': (obs_embeddings, act_tokens)}, start_pos=start_pos)
+        
+        # ========== 2. Observation and reward losses (same as compute_loss) ==========
+        # Handle different observation types
+        if self.obs_type == 'vector':
+            perceptual_loss = torch.tensor(0., device=batch['observations'].device,
+                                           dtype=batch['observations'].dtype)
+            latent_recon_loss = self.latent_recon_loss
+        elif self.obs_type == 'image':
+            latent_recon_loss = self.latent_recon_loss
+            perceptual_loss = self.perceptual_loss
+        elif self.obs_type == 'text':
+            perceptual_loss = torch.tensor(0., device=batch['observations'].device,
+                                           dtype=torch.float32)
+            decode_loss_mode = self.config.decode_loss_mode
+            if decode_loss_mode == "after_backbone":
+                next_latent_state = outputs.logits_observations[:, :-1, :]
+                next_target_ids = batch['observations'][:, 1:, :]
+                latent_recon_loss = self.tokenizer.decode_to_reconstruction_outputs(
+                    embeddings=next_latent_state,
+                    target_ids=next_target_ids,
+                ).loss
+            elif decode_loss_mode == "before_backbone":
+                latent_recon_loss = self.tokenizer.decode_to_reconstruction_outputs(
+                    embeddings=obs_embeddings,
+                    target_ids=batch['observations'],
+                ).loss
+            else:
+                latent_recon_loss = self.latent_recon_loss
+        else:
+            latent_recon_loss = self.latent_recon_loss
+            perceptual_loss = self.perceptual_loss
+        
+        # Compute labels for observations and rewards
+        with torch.no_grad():
+            target_obs_embeddings = target_tokenizer.encode_to_obs_embeddings(batch['observations'])
+        
+        labels_observations, labels_rewards, _ = self.compute_labels_world_model(
+            target_obs_embeddings, batch['rewards'], batch['ends'], batch['mask_padding']
+        )
+        
+        # Observation loss
+        logits_observations = rearrange(outputs.logits_observations[:, :-1], 'b t o -> (b t) o')
+        labels_observations = labels_observations.reshape(-1, self.projection_input_dim)
+        
+        if self.predict_latent_loss_type == 'mse':
+            loss_obs = F.mse_loss(logits_observations, labels_observations, reduction='none').mean(-1)
+        elif self.predict_latent_loss_type == 'group_kl':
+            batch_size, num_features = logits_observations.shape
+            epsilon = 1e-6
+            logits_reshaped = logits_observations.reshape(batch_size, self.num_groups, self.group_size) + epsilon
+            labels_reshaped = labels_observations.reshape(batch_size, self.num_groups, self.group_size) + epsilon
+            loss_obs = F.kl_div(logits_reshaped.log(), labels_reshaped, reduction='none').sum(dim=-1).mean(dim=-1)
+        else:
+            loss_obs = torch.tensor(0.0, device=logits_observations.device)
+        
+        mask_padding_expanded = batch['mask_padding'][:, 1:].contiguous().view(-1)
+        loss_obs = (loss_obs * mask_padding_expanded)
+        
+        # Reward loss
+        loss_rewards = self.compute_cross_entropy_loss(outputs, labels_rewards, batch, element='rewards')
+        
+        # ========== 3. PPO Policy Loss ==========
+        # Get PPO data from batch
+        advantages = batch['advantages'].float()  # [B, T]
+        old_log_prob = batch['old_log_prob'].float()  # [B, T]
+        actions = batch['actions'].long()  # [B, T] for discrete
+        
+        # Get policy logits and create distribution
+        policy_logits = outputs.logits_policy  # [B, T, A]
+        
+        if not self.continuous_action_space:
+            # Discrete action space
+            # Apply action mask if available
+            if 'action_mask' in batch:
+                action_mask = batch['action_mask'].bool()
+                masked_logits = policy_logits.masked_fill(~action_mask, -1e9)
+            else:
+                masked_logits = policy_logits
+            
+            # Create categorical distribution
+            dist = Categorical(logits=masked_logits)
+            log_prob = dist.log_prob(actions)  # [B, T]
+            entropy = dist.entropy()  # [B, T]
+        else:
+            # Continuous action space - extract mu and sigma
+            action_space_size = self.config.action_space_size
+            mu = policy_logits[:, :, :action_space_size]
+            sigma = policy_logits[:, :, action_space_size:]
+            dist = Independent(Normal(mu, sigma), 1)
+            log_prob = dist.log_prob(actions)  # [B, T]
+            entropy = dist.entropy()  # [B, T]
+        
+        # Calculate importance sampling ratio
+        ratio = torch.exp(log_prob - old_log_prob)  # [B, T]
+        
+        # Clipped surrogate loss
         surrogate1 = ratio * advantages
         surrogate2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
-        policy_loss = -torch.min(surrogate1, surrogate2).mean()
-
-        value_pred = inverse_scalar_transform_handle(batch['values']).squeeze(-1)
-        value_loss = torch.nn.functional.mse_loss(value_pred, returns)
-
-        entropy_mean = entropy.mean()
-        entropy_loss = -entropy_mean
-
-        loss_total = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss
-
-        return {
-            'loss_total': loss_total,
-            'loss_policy': policy_loss,
-            'loss_value': value_loss,
-            'loss_entropy': entropy_loss,
-            'entropy_mean': entropy_mean,
-            'ratio_mean': ratio.mean(),
-            'advantage_mean': advantages.mean(),
-            'return_mean': returns.mean(),
-        }
+        clipped_surrogate = torch.min(surrogate1, surrogate2)  # [B, T]
+        
+        # Apply mask and compute policy loss
+        mask_padding = batch['mask_padding'][:, :policy_logits.shape[1]]  # [B, T]
+        policy_loss = -(clipped_surrogate * mask_padding).sum() / (mask_padding.sum() + 1e-8)
+        
+        # Policy entropy (for logging)
+        policy_entropy = (entropy * mask_padding).sum() / (mask_padding.sum() + 1e-8)
+        
+        # ========== 4. PPO Value Loss (使用交叉熵，与 compute_loss 一致) ==========
+        returns_categorical = batch['returns']  # [B, T, support_size] - 已经是分类分布
+        
+        # 使用 compute_cross_entropy_loss 计算损失（与 compute_loss 一致）
+        # 准备 labels_value 格式
+        labels_returns = returns_categorical.reshape(-1, self.support_size)  # [B*T, support_size]
+        
+        # 使用现有的 compute_cross_entropy_loss 函数
+        value_loss = self.compute_cross_entropy_loss(outputs, returns_categorical, batch, element='value')
+        # value_loss 已经是 masked 的，需要取平均
+        value_loss = value_loss.sum() / (batch['mask_padding'].sum() + 1e-8)
+        
+        # ========== 5. Entropy Loss ==========
+        entropy_loss = -policy_entropy  # Negative entropy to encourage exploration
+        
+        # ========== 6. Total Loss ==========
+        # Discount coefficients
+        timesteps = torch.arange(batch['actions'].shape[1], device=batch['actions'].device)
+        discounts = self.gamma ** timesteps
+        
+        # Discounted losses
+        discounted_loss_obs = (loss_obs.view(-1, batch['actions'].shape[1] - 1) * discounts[1:]).sum() / (batch['mask_padding'][:, 1:].sum() + 1e-8)
+        discounted_loss_rewards = (loss_rewards.view(-1, batch['actions'].shape[1]) * discounts).sum() / (batch['mask_padding'].sum() + 1e-8)
+        
+        # Total loss
+        loss_total = (
+            discounted_loss_obs * self.latent_recon_loss_weight +
+            discounted_loss_rewards +
+            policy_loss +
+            value_coef * value_loss +
+            entropy_coef * entropy_loss
+        )
+        
+        # ========== 7. Return LossWithIntermediateLosses ==========
+        return LossWithIntermediateLosses(
+            latent_recon_loss_weight=self.latent_recon_loss_weight,
+            perceptual_loss_weight=self.perceptual_loss_weight,
+            continuous_action_space=self.continuous_action_space,
+            loss_obs=discounted_loss_obs,
+            loss_rewards=discounted_loss_rewards,
+            loss_value=value_loss,
+            loss_policy=policy_loss,
+            latent_recon_loss=discounted_loss_obs,  # Using obs loss as latent recon loss
+            perceptual_loss=perceptual_loss,
+            orig_policy_loss=policy_loss,
+            policy_entropy=policy_entropy,
+            first_step_losses={},
+            middle_step_losses={},
+            last_step_losses={},
+            dormant_ratio_encoder=torch.tensor(0.0),
+            dormant_ratio_world_model=torch.tensor(0.0),
+            latent_state_l2_norms=torch.tensor(0.0),
+            loss_total=loss_total,
+        )
 
     
-    def compute_loss_ppo(
-            self,
-            batch: Dict[str, torch.Tensor],
-            inverse_scalar_transform_handle,
-            clip_ratio: float,
-            value_coef: float,
-            entropy_coef: float,
-    ) -> Dict[str, torch.Tensor]:
-        """Compute PPO losses given policy logits and associated targets."""
-        policy_logits = batch['policy_logits']
-        action_mask = batch['action_mask'].bool()
-        actions = batch['actions'].long()
-        old_log_prob = batch['old_log_prob'].float()
-        advantages = batch['advantages'].float()
-        returns = batch['returns'].float()
+    # def compute_loss_ppo(
+    #         self,
+    #         batch: Dict[str, torch.Tensor],
+    #         inverse_scalar_transform_handle,
+    #         clip_ratio: float,
+    #         value_coef: float,
+    #         entropy_coef: float,
+    # ) -> Dict[str, torch.Tensor]:
+    #     """Compute PPO losses given policy logits and associated targets."""
+    #     policy_logits = batch['policy_logits']
+    #     action_mask = batch['action_mask'].bool()
+    #     actions = batch['actions'].long()
+    #     old_log_prob = batch['old_log_prob'].float()
+    #     advantages = batch['advantages'].float()
+    #     returns = batch['returns'].float()
+        
+    #     # import pudb;pudb.set_trace()
+        
+    #     pred_values = inverse_scalar_transform_handle(batch['values']).squeeze(-1)
 
-        pred_values = inverse_scalar_transform_handle(batch['values']).squeeze(-1)
+    #     masked_logits = policy_logits.masked_fill(~action_mask, -1e9)
+    #     dist = Categorical(logits=masked_logits)
+    #     log_prob = dist.log_prob(actions)
+    #     entropy = dist.entropy()
 
-        masked_logits = policy_logits.masked_fill(~action_mask, -1e9)
-        dist = Categorical(logits=masked_logits)
-        log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
+    #     ratio = torch.exp(log_prob - old_log_prob)
+    #     surrogate1 = ratio * advantages
+    #     surrogate2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
+    #     policy_loss = -torch.min(surrogate1, surrogate2).mean()
+    #     value_loss = F.mse_loss(pred_values, returns)
+    #     entropy_mean = entropy.mean()
+    #     entropy_loss = -entropy_mean
 
-        ratio = torch.exp(log_prob - old_log_prob)
-        surrogate1 = ratio * advantages
-        surrogate2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
-        policy_loss = -torch.min(surrogate1, surrogate2).mean()
-        value_loss = F.mse_loss(pred_values, returns)
-        entropy_mean = entropy.mean()
-        entropy_loss = -entropy_mean
+    #     loss_total = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss
 
-        loss_total = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss
-
-        return {
-            'loss_total': loss_total,
-            'loss_policy': policy_loss,
-            'loss_value': value_loss,
-            'loss_entropy': entropy_loss,
-            'entropy_mean': entropy_mean,
-            'ratio_mean': ratio.mean(),
-            'advantage_mean': advantages.mean(),
-            'return_mean': returns.mean(),
-        }
+    #     return {
+    #         'loss_total': loss_total,
+    #         'loss_policy': policy_loss,
+    #         'loss_value': value_loss,
+    #         'loss_entropy': entropy_loss,
+    #         'entropy_mean': entropy_mean,
+    #         'ratio_mean': ratio.mean(),
+    #         'advantage_mean': advantages.mean(),
+    #         'return_mean': returns.mean(),
+    #     }
     # TODO: test correctness
     def _calculate_policy_loss_cont_simple(self, outputs, batch: dict):
         """

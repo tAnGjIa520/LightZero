@@ -357,6 +357,12 @@ class UniZeroPolicy(MuZeroPolicy):
         self.value_inverse_scalar_transform_handle = InverseScalarTransform(self.value_support, self._cfg.model.categorical_distribution)
         self.reward_inverse_scalar_transform_handle = InverseScalarTransform(self.reward_support, self._cfg.model.categorical_distribution)
 
+        # PPO: Initialize PPO hyperparameters from config
+        # Note: self._cfg is already the policy config, so use self._cfg.ppo directly
+        self.ppo_clip_ratio = getattr(self._cfg.ppo, 'clip_ratio', 0.2)
+        self.ppo_value_coef = getattr(self._cfg.ppo, 'value_coef', 0.5)
+        self.ppo_entropy_coef = getattr(self._cfg.ppo, 'entropy_coef', 0.01)
+
         self.intermediate_losses = defaultdict(float)
         self.l2_norm_before = 0.
         self.l2_norm_after = 0.
@@ -388,17 +394,43 @@ class UniZeroPolicy(MuZeroPolicy):
         """
         self._learn_model.train()
         self._target_model.train()
-
         current_batch, target_batch, train_iter = data
-        obs_batch_ori, action_batch,  target_action_batch, mask_batch, indices, weights, make_time, timestep_batch = current_batch
+        # PPO: current_batch now contains 11 elements: obs, action, bootstrap_action, mask, indices, weights, make_time, timestep, advantage, old_log_prob, return
+        obs_batch_ori, action_batch, target_action_batch, mask_batch, indices, weights, make_time, timestep_batch, advantage_batch, old_log_prob_batch, return_batch = current_batch
         target_reward, target_value, target_policy = target_batch
-
+        
         # Prepare observations based on frame stack number
         if self._cfg.model.frame_stack_num > 1:
             obs_batch, obs_target_batch = prepare_obs_stack_for_unizero(obs_batch_ori, self._cfg)
         else:
             obs_batch, obs_target_batch = prepare_obs(obs_batch_ori, self._cfg)  # TODO: optimize
 
+        # print(f"\n{'='*80}")
+        # print(f"current_batch shapes:")
+        # print(f"  obs_batch_ori: {obs_batch_ori.shape if hasattr(obs_batch_ori, 'shape') else type(obs_batch_ori)}")
+        # print(f"  action_batch: {action_batch.shape if hasattr(action_batch, 'shape') else type(action_batch)}")
+        # print(f"  target_action_batch: {target_action_batch.shape if hasattr(target_action_batch, 'shape') else type(target_action_batch)}")
+        # print(f"  mask_batch: {mask_batch.shape if hasattr(mask_batch, 'shape') else type(mask_batch)}")
+        # print(f"  indices: {indices.shape if hasattr(indices, 'shape') else type(indices)}")
+        # print(f"  weights: {weights.shape if hasattr(weights, 'shape') else type(weights)}")
+        # print(f"  make_time: {make_time.shape if hasattr(make_time, 'shape') else type(make_time)}")
+        # print(f"  timestep_batch: {timestep_batch.shape if hasattr(timestep_batch, 'shape') else type(timestep_batch)}")
+        # print(f"  advantage_batch: {advantage_batch.shape if hasattr(advantage_batch, 'shape') else type(advantage_batch)}")
+        # print(f"  old_log_prob_batch: {old_log_prob_batch.shape if hasattr(old_log_prob_batch, 'shape') else type(old_log_prob_batch)}")
+        # print(f"  return_batch: {return_batch.shape if hasattr(return_batch, 'shape') else type(return_batch)}")
+        # print(f"\ntarget_batch shapes:")
+        # print(f"  target_reward: {target_reward.shape if hasattr(target_reward, 'shape') else type(target_reward)}")
+        # print(f"  target_value: {target_value.shape if hasattr(target_value, 'shape') else type(target_value)}")
+        # print(f"  target_policy: {target_policy.shape if hasattr(target_policy, 'shape') else type(target_policy)}")
+        # print(f"{'='*80}\n")
+        # print(f"\n{'='*80}")
+        # print(f"Processed observation shapes:")
+        # print(f"  obs_batch: {obs_batch.shape if hasattr(obs_batch, 'shape') else type(obs_batch)}")
+        # print(f"  obs_target_batch: {obs_target_batch.shape if hasattr(obs_target_batch, 'shape') else type(obs_target_batch)}")
+        # print(f"  obs_batch_ori (original): {obs_batch_ori.shape if hasattr(obs_batch_ori, 'shape') else type(obs_batch_ori)}")
+        # print(f"{'='*80}\n")
+        # exit()
+        
         # Apply augmentations if needed
         if self._cfg.use_augmentation:
             obs_batch = self.image_transforms.transform(obs_batch)
@@ -424,6 +456,14 @@ class UniZeroPolicy(MuZeroPolicy):
         target_reward_categorical = phi_transform(self.reward_support, transformed_target_reward)
         target_value_categorical = phi_transform(self.value_support, transformed_target_value)
 
+        # PPO: Transform returns to categorical distribution (same as target_value)
+        # Convert return_batch to torch tensor and reshape
+        return_batch_tensor = torch.from_numpy(return_batch).to(self._cfg.device).float()
+        return_batch_reshaped = return_batch_tensor.view(self._cfg.batch_size, -1)  # [B, num_unroll_steps]
+        # Apply scalar_transform and phi_transform
+        transformed_returns = scalar_transform(return_batch_reshaped)
+        returns_categorical = phi_transform(self.value_support, transformed_returns)  # [B, num_unroll_steps, support_size]
+
         # Prepare batch for GPT model
         batch_for_gpt = {}
         if isinstance(self._cfg.model.observation_shape, int) or len(self._cfg.model.observation_shape) == 1:
@@ -445,15 +485,35 @@ class UniZeroPolicy(MuZeroPolicy):
         batch_for_gpt['target_value'] = target_value_categorical[:, :-1]
         batch_for_gpt['target_policy'] = target_policy[:, :-1]
 
+        # PPO: Add PPO-specific data to batch_for_gpt
+        # Convert numpy arrays to torch tensors and align shapes
+        advantage_batch_tensor = torch.from_numpy(advantage_batch).to(self._cfg.device).float()
+        old_log_prob_batch_tensor = torch.from_numpy(old_log_prob_batch).to(self._cfg.device).float()
+
+        # Align shapes: [B, num_unroll_steps] -> [B, T] where T matches target_value_categorical
+        # target_value_categorical is [B, num_unroll_steps+1, support_size], we take [:, :-1] to get [B, num_unroll_steps, support_size]
+        # returns_categorical is [B, num_unroll_steps, support_size], we need to align with target_value_categorical[:, :-1]
+        target_seq_len = batch_for_gpt['target_value'].shape[1]  # This is num_unroll_steps (after [:, :-1])
+        batch_for_gpt['advantages'] = advantage_batch_tensor[:, :target_seq_len]
+        batch_for_gpt['old_log_prob'] = old_log_prob_batch_tensor[:, :target_seq_len]
+        # Use categorical distribution version of returns (already transformed above)
+        # returns_categorical is [B, num_unroll_steps, support_size], align with target_seq_len
+        batch_for_gpt['returns'] = returns_categorical[:, :target_seq_len]  # [B, T, support_size]
+
         # Extract valid target policy data and compute entropy
         valid_target_policy = batch_for_gpt['target_policy'][batch_for_gpt['mask_padding']]
         target_policy_entropy = -torch.sum(valid_target_policy * torch.log(valid_target_policy + 1e-9), dim=-1)
         average_target_policy_entropy = target_policy_entropy.mean()
 
-        # Update world model
-        losses = self._learn_model.world_model.compute_loss(
-            batch_for_gpt, self._target_model.world_model.tokenizer, self.value_inverse_scalar_transform_handle
-        )           # NOTE : compute_loss third argument is now a dead argument. If this changes, it could need adaptation between value_inverse and reward_inverse.
+        # Update world model with PPO loss
+        losses = self._learn_model.world_model.compute_loss_ppo(
+            batch_for_gpt,
+            self._target_model.world_model.tokenizer,
+            self.value_inverse_scalar_transform_handle,
+            clip_ratio=self.ppo_clip_ratio,
+            value_coef=self.ppo_value_coef,
+            entropy_coef=self.ppo_entropy_coef,
+        )
 
         weighted_total_loss = losses.loss_total
         for loss_name, loss_value in losses.intermediate_losses.items():
@@ -467,9 +527,9 @@ class UniZeroPolicy(MuZeroPolicy):
         perceptual_loss = self.intermediate_losses['perceptual_loss']
         orig_policy_loss = self.intermediate_losses['orig_policy_loss']
         policy_entropy = self.intermediate_losses['policy_entropy']
-        first_step_losses = self.intermediate_losses['first_step_losses']
-        middle_step_losses = self.intermediate_losses['middle_step_losses']
-        last_step_losses = self.intermediate_losses['last_step_losses']
+        # first_step_losses = self.intermediate_losses['first_step_losses']
+        # middle_step_losses = self.intermediate_losses['middle_step_losses']
+        # last_step_losses = self.intermediate_losses['last_step_losses']
         dormant_ratio_encoder = self.intermediate_losses['dormant_ratio_encoder']
         dormant_ratio_world_model = self.intermediate_losses['dormant_ratio_world_model']
         latent_state_l2_norms = self.intermediate_losses['latent_state_l2_norms']
@@ -531,20 +591,19 @@ class UniZeroPolicy(MuZeroPolicy):
             max_memory_allocated_gb = 0.
 
         return_log_dict = {
-            'analysis/first_step_loss_value': first_step_losses['loss_value'].item(),
-            'analysis/first_step_loss_policy': first_step_losses['loss_policy'].item(),
-            'analysis/first_step_loss_rewards': first_step_losses['loss_rewards'].item(),
-            'analysis/first_step_loss_obs': first_step_losses['loss_obs'].item(),
-
-            'analysis/middle_step_loss_value': middle_step_losses['loss_value'].item(),
-            'analysis/middle_step_loss_policy': middle_step_losses['loss_policy'].item(),
-            'analysis/middle_step_loss_rewards': middle_step_losses['loss_rewards'].item(),
-            'analysis/middle_step_loss_obs': middle_step_losses['loss_obs'].item(),
-
-            'analysis/last_step_loss_value': last_step_losses['loss_value'].item(),
-            'analysis/last_step_loss_policy': last_step_losses['loss_policy'].item(),
-            'analysis/last_step_loss_rewards': last_step_losses['loss_rewards'].item(),
-            'analysis/last_step_loss_obs': last_step_losses['loss_obs'].item(),
+            # Step losses statistics removed
+            # 'analysis/first_step_loss_value': first_step_losses['loss_value'].item(),
+            # 'analysis/first_step_loss_policy': first_step_losses['loss_policy'].item(),
+            # 'analysis/first_step_loss_rewards': first_step_losses['loss_rewards'].item(),
+            # 'analysis/first_step_loss_obs': first_step_losses['loss_obs'].item(),
+            # 'analysis/middle_step_loss_value': middle_step_losses['loss_value'].item(),
+            # 'analysis/middle_step_loss_policy': middle_step_losses['loss_policy'].item(),
+            # 'analysis/middle_step_loss_rewards': middle_step_losses['loss_rewards'].item(),
+            # 'analysis/middle_step_loss_obs': middle_step_losses['loss_obs'].item(),
+            # 'analysis/last_step_loss_value': last_step_losses['loss_value'].item(),
+            # 'analysis/last_step_loss_policy': last_step_losses['loss_policy'].item(),
+            # 'analysis/last_step_loss_rewards': last_step_losses['loss_rewards'].item(),
+            # 'analysis/last_step_loss_obs': last_step_losses['loss_obs'].item(),
 
             'Current_GPU': current_memory_allocated_gb,
             'Max_GPU': max_memory_allocated_gb,
@@ -668,78 +727,130 @@ class UniZeroPolicy(MuZeroPolicy):
             policy_logits = policy_logits.detach().cpu().numpy().tolist()
 
             legal_actions = [[i for i, x in enumerate(action_mask[j]) if x == 1] for j in range(active_collect_env_num)]
-            # the only difference between collect and eval is the dirichlet noise
-            noises = [
-                np.random.dirichlet([self._cfg.root_dirichlet_alpha] * int(sum(action_mask[j]))
-                                    ).astype(np.float32).tolist() for j in range(active_collect_env_num)
-            ]
-            if self._cfg.mcts_ctree:
-                # cpp mcts_tree
-                roots = MCTSCtree.roots(active_collect_env_num, legal_actions)
-            else:
-                # python mcts_tree
-                roots = MCTSPtree.roots(active_collect_env_num, legal_actions)
-
-            roots.prepare(self._cfg.root_noise_weight, noises, reward_roots, policy_logits, to_play)
-
-            next_latent_state_with_env = self._mcts_collect.search(roots, self._collect_model, latent_state_roots, to_play, timestep)
             
-            # list of list, shape: ``{list: batch_size} -> {list: action_space_size}``
-            roots_visit_count_distributions = roots.get_distributions()
-            roots_values = roots.get_values()  # shape: {list: batch_size}
-
-
-            batch_action = []
-            for i, env_id in enumerate(ready_env_id):
-                distributions, value = roots_visit_count_distributions[i], roots_values[i]
-                
-                if self._cfg.eps.eps_greedy_exploration_in_collect:
-                    # eps greedy collect
-                    action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
-                        distributions, temperature=self._collect_mcts_temperature, deterministic=True
-                    )
-                    action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
-                    if np.random.rand() < self._collect_epsilon:
-                        action = np.random.choice(legal_actions[i])
-                else:
-                    # normal collect
-                    # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
-                    # the index within the legal action set, rather than the index in the entire action set.
-                    action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
-                        distributions, temperature=self._collect_mcts_temperature, deterministic=False
-                    )
-                    # NOTE: Convert the ``action_index_in_legal_action_set`` to the corresponding ``action`` in the entire action set.
-                    action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
-
-                next_latent_state = next_latent_state_with_env[i][action]
-                
-                if self._cfg.model.world_model_cfg.obs_type == 'text' and self._cfg.model.world_model_cfg.decode_loss_mode is not None and self._cfg.model.world_model_cfg.decode_loss_mode.lower() != 'none':
-                    # Output the plain text content decoded by the decoder from the next latent state
-                    predicted_next = self._collect_model.tokenizer.decode_to_plain_text(embeddings=next_latent_state, max_length=256)
-                else:
+            if self._cfg.collect_with_pure_policy:
+                # 纯策略模式：直接使用 policy_logits，跳过 MCTS
+                batch_action = []
+                for i, env_id in enumerate(ready_env_id):
+                    # 1. 将 policy_logits 转换为 numpy array
+                    logits = np.array(policy_logits[i])
+                    
+                    # 2. 应用 action_mask
+                    masked_logits = logits.copy()
+                    masked_logits[action_mask[i] == 0] = -1e9
+                    
+                    # 3. 应用 softmax + temperature
+                    exp_logits = np.exp((masked_logits - np.max(masked_logits)) / self._collect_mcts_temperature)
+                    probs = exp_logits / (np.sum(exp_logits) + 1e-8)
+                    
+                    # 4. 采样动作（或 argmax，根据 eps_greedy 配置）
+                    if self._cfg.eps.eps_greedy_exploration_in_collect:
+                        action = np.argmax(probs)
+                        if np.random.rand() < self._collect_epsilon:
+                            action = np.random.choice(legal_actions[i])
+                    else:
+                        # 采样
+                        action = np.random.choice(len(probs), p=probs)
+                    
+                    # 5. 计算熵
+                    visit_count_distribution_entropy = -np.sum(probs * np.log(probs + 1e-8))
+                    
+                    # 6. 设置返回值
+                    distributions = probs.tolist()
+                    value = pred_values[i]  # 使用 predicted_value
+                    
+                    # 7. 处理 predicted_next_text（如果需要，可以通过 recurrent_inference 获取，这里先设为 None）
+                    # 注意：如果需要 predicted_next_text，可以在这里添加 recurrent_inference 调用
                     predicted_next = None
+                    
+                    output[env_id] = {
+                        'action': int(action),
+                        'visit_count_distributions': distributions,
+                        'visit_count_distribution_entropy': visit_count_distribution_entropy,
+                        'searched_value': value,
+                        'predicted_value': pred_values[i],
+                        'predicted_policy_logits': policy_logits[i],
+                        'timestep': timestep[i],
+                        'predicted_next_text': predicted_next,
+                    }
+                    batch_action.append(int(action))
+                
+                self.last_batch_obs = data
+                self.last_batch_action = batch_action
+            else:
+                # 原有 MCTS 逻辑
+                # the only difference between collect and eval is the dirichlet noise
+                noises = [
+                    np.random.dirichlet([self._cfg.root_dirichlet_alpha] * int(sum(action_mask[j]))
+                                        ).astype(np.float32).tolist() for j in range(active_collect_env_num)
+                ]
+                if self._cfg.mcts_ctree:
+                    # cpp mcts_tree
+                    roots = MCTSCtree.roots(active_collect_env_num, legal_actions)
+                else:
+                    # python mcts_tree
+                    roots = MCTSPtree.roots(active_collect_env_num, legal_actions)
 
-                # ============== TODO: only for visualize ==============
-                # action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
-                #     distributions, temperature=self._collect_mcts_temperature, deterministic=True
-                # )
-                # action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
-                # ============== TODO: only for visualize ==============
+                roots.prepare(self._cfg.root_noise_weight, noises, reward_roots, policy_logits, to_play)
 
-                output[env_id] = {
-                    'action': action,
-                    'visit_count_distributions': distributions,
-                    'visit_count_distribution_entropy': visit_count_distribution_entropy,
-                    'searched_value': value,
-                    'predicted_value': pred_values[i],
-                    'predicted_policy_logits': policy_logits[i],
-                    'timestep': timestep[i],
-                    'predicted_next_text': predicted_next,
-                }
-                batch_action.append(action)
+                next_latent_state_with_env = self._mcts_collect.search(roots, self._collect_model, latent_state_roots, to_play, timestep)
+                
+                # list of list, shape: ``{list: batch_size} -> {list: action_space_size}``
+                roots_visit_count_distributions = roots.get_distributions()
+                roots_values = roots.get_values()  # shape: {list: batch_size}
 
-            self.last_batch_obs = data
-            self.last_batch_action = batch_action
+
+                batch_action = []
+                for i, env_id in enumerate(ready_env_id):
+                    distributions, value = roots_visit_count_distributions[i], roots_values[i]
+                    
+                    if self._cfg.eps.eps_greedy_exploration_in_collect:
+                        # eps greedy collect
+                        action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
+                            distributions, temperature=self._collect_mcts_temperature, deterministic=True
+                        )
+                        action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
+                        if np.random.rand() < self._collect_epsilon:
+                            action = np.random.choice(legal_actions[i])
+                    else:
+                        # normal collect
+                        # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
+                        # the index within the legal action set, rather than the index in the entire action set.
+                        action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
+                            distributions, temperature=self._collect_mcts_temperature, deterministic=False
+                        )
+                        # NOTE: Convert the ``action_index_in_legal_action_set`` to the corresponding ``action`` in the entire action set.
+                        action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
+
+                    next_latent_state = next_latent_state_with_env[i][action]
+                    
+                    if self._cfg.model.world_model_cfg.obs_type == 'text' and self._cfg.model.world_model_cfg.decode_loss_mode is not None and self._cfg.model.world_model_cfg.decode_loss_mode.lower() != 'none':
+                        # Output the plain text content decoded by the decoder from the next latent state
+                        predicted_next = self._collect_model.tokenizer.decode_to_plain_text(embeddings=next_latent_state, max_length=256)
+                    else:
+                        predicted_next = None
+
+                    # ============== TODO: only for visualize ==============
+                    # action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
+                    #     distributions, temperature=self._collect_mcts_temperature, deterministic=True
+                    # )
+                    # action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
+                    # ============== TODO: only for visualize ==============
+
+                    output[env_id] = {
+                        'action': action,
+                        'visit_count_distributions': distributions,
+                        'visit_count_distribution_entropy': visit_count_distribution_entropy,
+                        'searched_value': value,
+                        'predicted_value': pred_values[i],
+                        'predicted_policy_logits': policy_logits[i],
+                        'timestep': timestep[i],
+                        'predicted_next_text': predicted_next,
+                    }
+                    batch_action.append(action)
+
+                self.last_batch_obs = data
+                self.last_batch_action = batch_action
 
             # ========= TODO: for muzero_segment_collector now =========
             if active_collect_env_num < self.collector_env_num:
@@ -813,59 +924,107 @@ class UniZeroPolicy(MuZeroPolicy):
             policy_logits = policy_logits.detach().cpu().numpy().tolist()  # list shape（B, A）
 
             legal_actions = [[i for i, x in enumerate(action_mask[j]) if x == 1] for j in range(active_eval_env_num)]
-            if self._cfg.mcts_ctree:
-                # cpp mcts_tree
-                roots = MCTSCtree.roots(active_eval_env_num, legal_actions)
-            else:
-                # python mcts_tree
-                roots = MCTSPtree.roots(active_eval_env_num, legal_actions)
-            roots.prepare_no_noise(reward_roots, policy_logits, to_play)
-            next_latent_state_with_env = self._mcts_eval.search(roots, self._eval_model, latent_state_roots, to_play, timestep)
-
-            # list of list, shape: ``{list: batch_size} -> {list: action_space_size}``
-            roots_visit_count_distributions = roots.get_distributions()
-            roots_values = roots.get_values()  # shape: {list: batch_size}
-
-            batch_action = []
             
-            for i, env_id in enumerate(ready_env_id):
-                distributions, value = roots_visit_count_distributions[i], roots_values[i]
-                # print("roots_visit_count_distributions:", distributions, "root_value:", value)
-
-                # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
-                # the index within the legal action set, rather than the index in the entire action set.
-                #  Setting deterministic=True implies choosing the action with the highest value (argmax) rather than
-                # sampling during the evaluation phase.
-                action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
-                    distributions, temperature=1, deterministic=True
-                )
-                # NOTE: Convert the ``action_index_in_legal_action_set`` to the corresponding ``action`` in the
-                # entire action set.
-                action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
-
-                # Predict the next latent state based on the selected action and policy
-                next_latent_state = next_latent_state_with_env[i][action]
-
-                if self._cfg.model.world_model_cfg.obs_type == 'text' and self._cfg.model.world_model_cfg.decode_loss_mode is not None and self._cfg.model.world_model_cfg.decode_loss_mode.lower() != 'none':
-                    # Output the plain text content decoded by the decoder from the next latent state
-                    predicted_next = self._eval_model.tokenizer.decode_to_plain_text(embeddings=next_latent_state, max_length=256)
-                else:
+            # 检查是否使用纯策略模式（复用 collect_with_pure_policy 配置，或使用单独的 eval_with_pure_policy）
+            use_pure_policy = getattr(self._cfg, 'eval_with_pure_policy', False) or getattr(self._cfg, 'collect_with_pure_policy', False)
+            
+            if use_pure_policy:
+                # 纯策略模式：直接使用 policy_logits，跳过 MCTS
+                batch_action = []
+                for i, env_id in enumerate(ready_env_id):
+                    # 1. 将 policy_logits 转换为 numpy array
+                    logits = np.array(policy_logits[i])
+                    
+                    # 2. 应用 action_mask
+                    masked_logits = logits.copy()
+                    masked_logits[action_mask[i] == 0] = -1e9
+                    
+                    # 3. 应用 softmax（评估模式使用 temperature=1，确定性选择）
+                    exp_logits = np.exp(masked_logits - np.max(masked_logits))
+                    probs = exp_logits / (np.sum(exp_logits) + 1e-8)
+                    
+                    # 4. 选择动作（评估模式使用 argmax，确定性）
+                    action = np.argmax(probs)
+                    
+                    # 5. 计算熵
+                    visit_count_distribution_entropy = -np.sum(probs * np.log(probs + 1e-8))
+                    
+                    # 6. 设置返回值
+                    distributions = probs.tolist()
+                    value = pred_values[i]  # 使用 predicted_value
+                    
+                    # 7. 处理 predicted_next_text（如果需要，可以通过 recurrent_inference 获取，这里先设为 None）
                     predicted_next = None
+                    
+                    output[env_id] = {
+                        'action': int(action),
+                        'visit_count_distributions': distributions,
+                        'visit_count_distribution_entropy': visit_count_distribution_entropy,
+                        'searched_value': value,
+                        'predicted_value': pred_values[i],
+                        'predicted_policy_logits': policy_logits[i],
+                        'timestep': timestep[i],
+                        'predicted_next_text': predicted_next,
+                    }
+                    batch_action.append(int(action))
+                
+                self.last_batch_obs = data
+                self.last_batch_action = batch_action
+            else:
+                # 原有 MCTS 逻辑
+                if self._cfg.mcts_ctree:
+                    # cpp mcts_tree
+                    roots = MCTSCtree.roots(active_eval_env_num, legal_actions)
+                else:
+                    # python mcts_tree
+                    roots = MCTSPtree.roots(active_eval_env_num, legal_actions)
+                roots.prepare_no_noise(reward_roots, policy_logits, to_play)
+                next_latent_state_with_env = self._mcts_eval.search(roots, self._eval_model, latent_state_roots, to_play, timestep)
 
-                output[env_id] = {
-                    'action': action,
-                    'visit_count_distributions': distributions,
-                    'visit_count_distribution_entropy': visit_count_distribution_entropy,
-                    'searched_value': value,
-                    'predicted_value': pred_values[i],
-                    'predicted_policy_logits': policy_logits[i],
-                    'timestep': timestep[i],
-                    'predicted_next_text': predicted_next,
-                }
-                batch_action.append(action)
+                # list of list, shape: ``{list: batch_size} -> {list: action_space_size}``
+                roots_visit_count_distributions = roots.get_distributions()
+                roots_values = roots.get_values()  # shape: {list: batch_size}
 
-            self.last_batch_obs = data
-            self.last_batch_action = batch_action
+                batch_action = []
+                
+                for i, env_id in enumerate(ready_env_id):
+                    distributions, value = roots_visit_count_distributions[i], roots_values[i]
+                    # print("roots_visit_count_distributions:", distributions, "root_value:", value)
+
+                    # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
+                    # the index within the legal action set, rather than the index in the entire action set.
+                    #  Setting deterministic=True implies choosing the action with the highest value (argmax) rather than
+                    # sampling during the evaluation phase.
+                    action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
+                        distributions, temperature=1, deterministic=True
+                    )
+                    # NOTE: Convert the ``action_index_in_legal_action_set`` to the corresponding ``action`` in the
+                    # entire action set.
+                    action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
+
+                    # Predict the next latent state based on the selected action and policy
+                    next_latent_state = next_latent_state_with_env[i][action]
+
+                    if self._cfg.model.world_model_cfg.obs_type == 'text' and self._cfg.model.world_model_cfg.decode_loss_mode is not None and self._cfg.model.world_model_cfg.decode_loss_mode.lower() != 'none':
+                        # Output the plain text content decoded by the decoder from the next latent state
+                        predicted_next = self._eval_model.tokenizer.decode_to_plain_text(embeddings=next_latent_state, max_length=256)
+                    else:
+                        predicted_next = None
+
+                    output[env_id] = {
+                        'action': action,
+                        'visit_count_distributions': distributions,
+                        'visit_count_distribution_entropy': visit_count_distribution_entropy,
+                        'searched_value': value,
+                        'predicted_value': pred_values[i],
+                        'predicted_policy_logits': policy_logits[i],
+                        'timestep': timestep[i],
+                        'predicted_next_text': predicted_next,
+                    }
+                    batch_action.append(action)
+
+                self.last_batch_obs = data
+                self.last_batch_action = batch_action
 
         return output
 

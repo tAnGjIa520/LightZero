@@ -15,6 +15,7 @@ from easydict import EasyDict
 
 from lzero.mcts.buffer.game_segment import GameSegment
 from lzero.mcts.utils import prepare_observation
+from lzero.policy.utils import mz_network_output_unpack
 
 
 class MuZeroEvaluator(ISerialEvaluator):
@@ -309,46 +310,33 @@ class MuZeroEvaluator(ISerialEvaluator):
                     stack_obs = torch.from_numpy(stack_obs).to(self.policy_config.device).float()
 
                     # ==============================================================
-                    # policy forward
+                    # policy forward (without MCTS - use predicted_policy_logits directly)
                     # ==============================================================
+                    # Call policy.forward() to get policy output (this will still run MCTS internally,
+                    # but we'll ignore the MCTS action and use predicted_policy_logits instead)
                     policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep)
                     
-                    actions_with_env_id = {k: v['action'] for k, v in policy_output.items()}
-                    distributions_dict_with_env_id = {k: v['visit_count_distributions'] for k, v in policy_output.items()}
-                    if self.policy_config.sampled_algo:
-                        root_sampled_actions_dict_with_env_id = {
-                            k: v['root_sampled_actions']
-                            for k, v in policy_output.items()
-                        }
-
-                    value_dict_with_env_id = {k: v['searched_value'] for k, v in policy_output.items()}
-                    pred_value_dict_with_env_id = {k: v['predicted_value'] for k, v in policy_output.items()}
-                    timestep_dict_with_env_id = {
-                        k: v['timestep'] if 'timestep' in v else -1 for k, v in policy_output.items()
-                    }
-                    visit_entropy_dict_with_env_id = {
-                        k: v['visit_count_distribution_entropy']
-                        for k, v in policy_output.items()
-                    }
-
+                    # Extract predicted_policy_logits from policy output
                     actions = {}
-                    distributions_dict = {}
-                    if self.policy_config.sampled_algo:
-                        root_sampled_actions_dict = {}
-                    value_dict = {}
-                    pred_value_dict = {}
-                    timestep_dict = {}
-                    visit_entropy_dict = {}
-
-                    for index, env_id in enumerate(ready_env_id):
-                        actions[env_id] = actions_with_env_id.pop(env_id)
-                        distributions_dict[env_id] = distributions_dict_with_env_id.pop(env_id)
-                        if self.policy_config.sampled_algo:
-                            root_sampled_actions_dict[env_id] = root_sampled_actions_dict_with_env_id.pop(env_id)
-                        value_dict[env_id] = value_dict_with_env_id.pop(env_id)
-                        pred_value_dict[env_id] = pred_value_dict_with_env_id.pop(env_id)
-                        timestep_dict[env_id] = timestep_dict_with_env_id.pop(env_id)
-                        visit_entropy_dict[env_id] = visit_entropy_dict_with_env_id.pop(env_id)
+                    for idx, env_id in enumerate(ready_env_id):
+                        if env_id in policy_output:
+                            # Get predicted_policy_logits (from initial inference, before MCTS)
+                            if 'predicted_policy_logits' in policy_output[env_id]:
+                                policy_logits = np.array(policy_output[env_id]['predicted_policy_logits'])
+                                
+                                # Apply action mask (action_mask is a list, indexed by ready_env_id order)
+                                masked_logits = policy_logits.copy()
+                                masked_logits[action_mask[idx] == 0] = -1e9
+                                
+                                # Select action with highest probability (argmax) - deterministic evaluation
+                                action = np.argmax(masked_logits)
+                                actions[env_id] = int(action)
+                            else:
+                                # Fallback: use MCTS action if predicted_policy_logits not available
+                                actions[env_id] = policy_output[env_id]['action']
+                        else:
+                            # If env_id not in output, use a default action (should not happen)
+                            actions[env_id] = 0
 
                     # ==============================================================
                     # Interact with env.

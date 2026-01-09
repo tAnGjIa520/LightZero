@@ -81,6 +81,12 @@ class GameSegment:
         if self.use_ture_chance_label_in_chance_encoder:
             self.chance_segment = []
 
+        # PPO related fields
+        self.episode_id = None  # 标记该 segment 属于哪个 episode
+        self.advantage_segment = []  # 用于存储 GAE advantages
+        self.old_log_prob_segment = []  # 用于存储收集时的 log_prob (PPO 需要)
+        self.return_segment = []  # 用于存储 return (PPO value training 需要)
+
         self.reanalyze_time = 0
 
     def get_unroll_obs(self, timestep: int, num_unroll_steps: int = 0, padding: bool = False) -> np.ndarray:
@@ -305,6 +311,14 @@ class GameSegment:
         if self.use_ture_chance_label_in_chance_encoder:
             self.chance_segment = np.array(self.chance_segment)
 
+        # Convert PPO related fields to numpy array
+        if len(self.advantage_segment) > 0:
+            self.advantage_segment = np.array(self.advantage_segment)
+        if len(self.old_log_prob_segment) > 0:
+            self.old_log_prob_segment = np.array(self.old_log_prob_segment)
+        if len(self.return_segment) > 0:
+            self.return_segment = np.array(self.return_segment)
+
     def reset(self, init_observations: np.ndarray) -> None:
         """
         Overview:
@@ -326,6 +340,11 @@ class GameSegment:
 
         if self.use_ture_chance_label_in_chance_encoder:
             self.chance_segment = []
+
+        # Reset PPO related fields
+        self.advantage_segment = []
+        self.old_log_prob_segment = []
+        self.return_segment = []
 
         assert len(init_observations) == self.frame_stack_num
 

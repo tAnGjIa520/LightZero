@@ -3,6 +3,7 @@ import os
 from functools import partial
 from typing import Tuple, Optional
 
+import numpy as np
 import torch
 import wandb
 from ding.config import compile_config
@@ -64,7 +65,7 @@ def train_unizero(
     game_buffer_classes = {'unizero': 'UniZeroGameBuffer', 'sampled_unizero': 'SampledUniZeroGameBuffer'}
     GameBuffer = getattr(__import__('lzero.mcts', fromlist=[game_buffer_classes[create_cfg.policy.type]]),
                          game_buffer_classes[create_cfg.policy.type])
-
+    
     # Check for GPU availability and set the device accordingly
     cfg.policy.device = cfg.policy.model.world_model_cfg.device if torch.cuda.is_available() else 'cpu'
     logging.info(f"Device set to: {cfg.policy.device}")
@@ -163,17 +164,42 @@ def train_unizero(
             collect_kwargs['epsilon'] = epsilon_greedy_fn(collector.envstep)
 
         # Evaluate policy performance
-        if learner.train_iter == 0 or evaluator.should_eval(learner.train_iter):
-            logging.info(f"Training iteration {learner.train_iter}: Starting evaluation...")
-            stop, reward = evaluator.eval(learner.save_checkpoint, learner.train_iter, collector.envstep)
-            logging.info(f"Training iteration {learner.train_iter}: Evaluation completed, stop condition: {stop}, current reward: {reward}")
-            if stop:
-                logging.info("Stopping condition met, training ends!")
-                break
+        # # if learner.train_iter == 0 or evaluator.should_eval(learner.train_iter):
+        logging.info(f"Training iteration {learner.train_iter}: Starting evaluation...")
+        stop, reward = evaluator.eval(learner.save_checkpoint, learner.train_iter, collector.envstep)
+        logging.info(f"Training iteration {learner.train_iter}: Evaluation completed, stop condition: {stop}, current reward: {reward}")
+        if stop:
+            logging.info("Stopping condition met, training ends!")
+            break
 
         # Collect new data
         new_data = collector.collect(train_iter=learner.train_iter, policy_kwargs=collect_kwargs)
-        logging.info(f"Rank {rank}, Training iteration {learner.train_iter}: New data collection completed!")
+        
+        # # Print new_data structure and advantage information
+        # data_segments, meta_data = new_data
+        # logging.info(f"\n{'='*80}")
+        # logging.info(f"Rank {rank}, Training iteration {learner.train_iter}: New data collection completed!")
+        # logging.info(f"Number of segments collected: {len(data_segments)}")
+        
+        # for i, segment in enumerate(data_segments):
+        #     logging.info(f"\n--- Segment {i} ---")
+        #     logging.info(f"  episode_id: {segment.episode_id}")
+        #     logging.info(f"  action_segment shape: {segment.action_segment.shape}")
+        #     logging.info(f"  reward_segment shape: {segment.reward_segment.shape}")
+        #     logging.info(f"  root_value_segment shape: {segment.root_value_segment.shape}")
+            
+        #     if hasattr(segment, 'advantage_segment') and len(segment.advantage_segment) > 0:
+        #         logging.info(f"  advantage_segment shape: {segment.advantage_segment.shape}")
+        #         logging.info(f"  advantage_segment (first 5): {segment.advantage_segment[:5]}")
+        #         logging.info(f"  advantage mean: {segment.advantage_segment.mean():.4f}, std: {segment.advantage_segment.std():.4f}")
+        #     else:
+        #         logging.info(f"  advantage_segment: NOT COMPUTED or EMPTY")
+            
+        #     logging.info(f"  meta_data - done: {meta_data[i]['done']}, priorities: {meta_data[i]['priorities']}")
+        
+        # logging.info(f"{'='*80}\n")
+        
+        # exit()
 
         # Determine updates per collection
         update_per_collect = cfg.policy.update_per_collect
@@ -208,7 +234,71 @@ def train_unizero(
 
             # Execute multiple training rounds
             for i in range(update_per_collect):
+                # 
                 train_data = replay_buffer.sample(batch_size, policy)
+                
+                # Print train_data structure (only first iteration)
+                # if i == 0 and learner.train_iter == 0:
+                #     logging.info(f"\n{'='*80}")
+                #     logging.info(f"train_data structure from replay_buffer.sample():")
+                #     logging.info(f"train_data type: {type(train_data)}")
+                #     logging.info(f"train_data length: {len(train_data)}")
+                    
+                #     if len(train_data) >= 2:
+                #         current_batch, target_batch = train_data[0], train_data[1]
+                        
+                #         logging.info(f"\n--- current_batch (input) ---")
+                #         logging.info(f"current_batch type: {type(current_batch)}")
+                #         logging.info(f"current_batch length: {len(current_batch)}")
+                        
+                #         current_batch_names = [
+                #             "obs_list (stacked observations)",
+                #             "action_list (actions at t)",
+                #             "bootstrap_action_list (actions at t+td_steps, UniZero)",
+                #             "mask_list (validity mask)",
+                #             "batch_index_list (sample indices)",
+                #             "weights_list (priority weights)",
+                #             "make_time_list (creation time)",
+                #             "timestep_list (timesteps for transformer, UniZero)",
+                #             "advantage_list (GAE advantages, PPO)",
+                #             "old_log_prob_list (old policy log probs, PPO)",
+                #             "return_list (GAE returns = advantage + value, PPO)"
+                #         ]
+                        
+                #         for idx, item in enumerate(current_batch):
+                #             name = current_batch_names[idx] if idx < len(current_batch_names) else f"unknown_{idx}"
+                #             if hasattr(item, 'shape'):
+                #                 logging.info(f"  current_batch[{idx}] ({name}): shape={item.shape}, dtype={item.dtype}")
+                #                 # Extra info for PPO-related metrics
+                #                 if idx == 8 and "advantage" in name.lower():  # advantage_list is index 8
+                #                     logging.info(f"    -> advantage mean: {item.mean():.4f}, std: {item.std():.4f}, min: {item.min():.4f}, max: {item.max():.4f}")
+                #                 elif idx == 9 and "log_prob" in name.lower():  # old_log_prob_list is index 9
+                #                     logging.info(f"    -> old_log_prob mean: {item.mean():.4f}, std: {item.std():.4f}, min: {item.min():.4f}, max: {item.max():.4f}")
+                #                 elif idx == 10 and "return" in name.lower():  # return_list is index 10
+                #                     logging.info(f"    -> return mean: {item.mean():.4f}, std: {item.std():.4f}, min: {item.min():.4f}, max: {item.max():.4f}")
+                #             else:
+                #                 logging.info(f"  current_batch[{idx}] ({name}): type={type(item)}, len={len(item) if hasattr(item, '__len__') else 'N/A'}")
+                        
+                #         logging.info(f"\n--- target_batch (labels) ---")
+                #         logging.info(f"target_batch type: {type(target_batch)}")
+                #         logging.info(f"target_batch length: {len(target_batch)}")
+                        
+                #         target_batch_names = [
+                #             "batch_rewards (target rewards)",
+                #             "batch_target_values (target values)",
+                #             "batch_target_policies (target policy distributions)"
+                #         ]
+                        
+                #         for idx, item in enumerate(target_batch):
+                #             name = target_batch_names[idx] if idx < len(target_batch_names) else f"unknown_{idx}"
+                #             if hasattr(item, 'shape'):
+                #                 logging.info(f"  target_batch[{idx}] ({name}): shape={item.shape}, dtype={item.dtype}")
+                #             else:
+                #                 logging.info(f"  target_batch[{idx}] ({name}): type={type(item)}, len={len(item) if hasattr(item, '__len__') else 'N/A'}")
+                    
+                #     logging.info(f"{'='*80}\n")
+                # # exit()
+                
                 if replay_buffer._cfg.reanalyze_ratio > 0 and i % 20 == 0:
                     policy.recompute_pos_emb_diff_and_clear_cache()
                 
@@ -220,6 +310,10 @@ def train_unizero(
                 log_vars = learner.train(train_data, collector.envstep)
                 if cfg.policy.use_priority:
                     replay_buffer.update_priority(train_data, log_vars[0]['value_priority_orig'])
+
+        # Clear replay buffer after training for online learning
+        if cfg.policy.get('online_learning', False):
+            replay_buffer.clear()
 
         policy.recompute_pos_emb_diff_and_clear_cache()
 
