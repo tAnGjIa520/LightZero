@@ -3,7 +3,7 @@ from easydict import EasyDict
 from zoo.atari.config.atari_env_action_space_map import atari_env_action_space_map
 
 
-def main(env_id='PongNoFrameskip-v4', seed=0, max_env_step=int(5e5)):
+def main(env_id='PongNoFrameskip-v4', seed=0):
     action_space_size = atari_env_action_space_map[env_id]
 
     # ==============================================================
@@ -11,8 +11,9 @@ def main(env_id='PongNoFrameskip-v4', seed=0, max_env_step=int(5e5)):
     # ==============================================================
     collector_env_num = 8
     game_segment_length = 20
-    evaluator_env_num = 8
+    evaluator_env_num = 3
     num_simulations = 50
+    max_env_step = int(5e5)
     batch_size = 64
     num_unroll_steps = 10
     infer_context_length = 4
@@ -24,6 +25,7 @@ def main(env_id='PongNoFrameskip-v4', seed=0, max_env_step=int(5e5)):
     # game_segment_length = 20
     # evaluator_env_num = 2
     # num_simulations = 2
+    # max_env_step = int(5e5)
     # batch_size = 10
     # num_unroll_steps = 5
     # infer_context_length = 2
@@ -32,7 +34,7 @@ def main(env_id='PongNoFrameskip-v4', seed=0, max_env_step=int(5e5)):
     # ==============================================================
     # end of the most frequently changed config specified by the user
     # ==============================================================
-    atari_unizero_config = dict(
+    atari_unizero_ppo_config = dict(
         env=dict(
             stop_value=int(1e6),
             env_id=env_id,
@@ -47,12 +49,8 @@ def main(env_id='PongNoFrameskip-v4', seed=0, max_env_step=int(5e5)):
             # eval_max_episode_steps=int(50),
         ),
         policy=dict(
-            type="unizero_ppo",
-            multi_gpu=False,
-            use_wandb=False,
             learn=dict(learner=dict(hook=dict(save_ckpt_after_iter=1000000, ), ), ),  # default is 10000
             model=dict(
-                model_type='conv',
                 observation_shape=(3, 64, 64),
                 action_space_size=action_space_size,
                 world_model_cfg=dict(
@@ -71,12 +69,12 @@ def main(env_id='PongNoFrameskip-v4', seed=0, max_env_step=int(5e5)):
                     rotary_emb=False,
                 ),
             ),
-            accumulation_steps=1,
             model_path=None,
             num_unroll_steps=num_unroll_steps,
             replay_ratio=replay_ratio,
             batch_size=batch_size,
             learning_rate=0.0001,
+            num_simulations=num_simulations,
             train_start_after_envsteps=2000,
             # train_start_after_envsteps=0, # TODO: only for debug
             game_segment_length=game_segment_length,
@@ -84,24 +82,25 @@ def main(env_id='PongNoFrameskip-v4', seed=0, max_env_step=int(5e5)):
             eval_freq=int(5e3),
             collector_env_num=collector_env_num,
             evaluator_env_num=evaluator_env_num,
-            update_per_collect=int(collector_env_num * game_segment_length * replay_ratio),
-            action_type="varied_action_space",
-            reanalyze_ratio=0,
-            n_episode=int(collector_env_num),
+            # Whether to use pure policy (without MCTS) for data collection
+            collect_with_pure_policy=True,
+            # Whether to use pure policy (without MCTS) for evaluation
+            # If not set, will use collect_with_pure_policy value
+            eval_with_pure_policy=True,
+            # Whether to use online learning (clear replay_buffer after each training iteration)
+            online_learning=True,
+            # PPO configuration for GAE computation
             ppo=dict(
-                rollout_length=64,
-                mini_batch_size=32,
-                update_epochs=4,
-                gamma=0.997,
-                gae_lambda=0.95,
-                clip_ratio=0.2,
-                entropy_coef=0.01,
-                advantage_normalization=True,
+                gamma=0.99,           # Discount factor
+                gae_lambda=0.95,      # GAE lambda parameter
+                clip_ratio=0.2,       # PPO clipping ratio
+                value_coef=0.5,       # Value loss coefficient
+                entropy_coef=0.01,   # Entropy loss coefficient
             ),
         ),
     )
-    atari_unizero_config = EasyDict(atari_unizero_config)
-    main_config = atari_unizero_config
+    atari_unizero_ppo_config = EasyDict(atari_unizero_ppo_config)
+    main_config = atari_unizero_ppo_config
 
     atari_unizero_ppo_create_config = dict(
         env=dict(
@@ -110,16 +109,16 @@ def main(env_id='PongNoFrameskip-v4', seed=0, max_env_step=int(5e5)):
         ),
         env_manager=dict(type='subprocess'),
         policy=dict(
-            type='unizero_ppo',
-            import_names=['lzero.policy.unizero_ppo'],
+            type='unizero',
+            import_names=['lzero.policy.unizero'],
         ),
     )
     atari_unizero_ppo_create_config = EasyDict(atari_unizero_ppo_create_config)
     create_config = atari_unizero_ppo_create_config
 
     main_config.exp_name = f'data_lz/data_unizero_ppo/{env_id[:-14]}/{env_id[:-14]}_uz_ppo_nlayer{num_layers}_gsl{game_segment_length}_rr{replay_ratio}_Htrain{num_unroll_steps}-Hinfer{infer_context_length}_bs{batch_size}_seed{seed}'
-    from lzero.entry import train_unizero_ppo
-    train_unizero_ppo([main_config, create_config], seed=seed, model_path=main_config.policy.model_path)
+    from lzero.entry import train_unizero
+    train_unizero([main_config, create_config], seed=seed, model_path=main_config.policy.model_path, max_env_step=max_env_step)
 
 
 if __name__ == "__main__":
@@ -127,8 +126,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process some environment.')
     parser.add_argument('--env', type=str, help='The environment to use', default='PongNoFrameskip-v4')
     parser.add_argument('--seed', type=int, help='The seed to use', default=0)
-    parser.add_argument('--max_env_step', type=int, help='The maximum environment steps', default=int(5e5))
     args = parser.parse_args()
 
-    main(args.env, args.seed, args.max_env_step)
-
+    main(args.env, args.seed)

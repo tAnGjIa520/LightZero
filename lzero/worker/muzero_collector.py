@@ -474,11 +474,10 @@ class MuZeroCollector(ISerialCollector):
                 # PPO: calculate log_prob from policy_logits and action
                 # Use predicted_policy_logits to compute log probability of the selected action
                 log_prob_dict_with_env_id = {}
+                # import pudb;pudb.set_trace()
+                
                 for k, v in policy_output.items():
-                    if 'log_prob' in v:
-                        # If log_prob is already provided, use it directly
-                        log_prob_dict_with_env_id[k] = v['log_prob']
-                    elif 'predicted_policy_logits' in v:
+                    if 'predicted_policy_logits' in v:
                         # Compute log_prob from policy_logits: log(softmax(logits)[action])
                         policy_logits = np.array(v['predicted_policy_logits'])
                         action = v['action']

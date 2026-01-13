@@ -404,32 +404,6 @@ class UniZeroPolicy(MuZeroPolicy):
             obs_batch, obs_target_batch = prepare_obs_stack_for_unizero(obs_batch_ori, self._cfg)
         else:
             obs_batch, obs_target_batch = prepare_obs(obs_batch_ori, self._cfg)  # TODO: optimize
-
-        # print(f"\n{'='*80}")
-        # print(f"current_batch shapes:")
-        # print(f"  obs_batch_ori: {obs_batch_ori.shape if hasattr(obs_batch_ori, 'shape') else type(obs_batch_ori)}")
-        # print(f"  action_batch: {action_batch.shape if hasattr(action_batch, 'shape') else type(action_batch)}")
-        # print(f"  target_action_batch: {target_action_batch.shape if hasattr(target_action_batch, 'shape') else type(target_action_batch)}")
-        # print(f"  mask_batch: {mask_batch.shape if hasattr(mask_batch, 'shape') else type(mask_batch)}")
-        # print(f"  indices: {indices.shape if hasattr(indices, 'shape') else type(indices)}")
-        # print(f"  weights: {weights.shape if hasattr(weights, 'shape') else type(weights)}")
-        # print(f"  make_time: {make_time.shape if hasattr(make_time, 'shape') else type(make_time)}")
-        # print(f"  timestep_batch: {timestep_batch.shape if hasattr(timestep_batch, 'shape') else type(timestep_batch)}")
-        # print(f"  advantage_batch: {advantage_batch.shape if hasattr(advantage_batch, 'shape') else type(advantage_batch)}")
-        # print(f"  old_log_prob_batch: {old_log_prob_batch.shape if hasattr(old_log_prob_batch, 'shape') else type(old_log_prob_batch)}")
-        # print(f"  return_batch: {return_batch.shape if hasattr(return_batch, 'shape') else type(return_batch)}")
-        # print(f"\ntarget_batch shapes:")
-        # print(f"  target_reward: {target_reward.shape if hasattr(target_reward, 'shape') else type(target_reward)}")
-        # print(f"  target_value: {target_value.shape if hasattr(target_value, 'shape') else type(target_value)}")
-        # print(f"  target_policy: {target_policy.shape if hasattr(target_policy, 'shape') else type(target_policy)}")
-        # print(f"{'='*80}\n")
-        # print(f"\n{'='*80}")
-        # print(f"Processed observation shapes:")
-        # print(f"  obs_batch: {obs_batch.shape if hasattr(obs_batch, 'shape') else type(obs_batch)}")
-        # print(f"  obs_target_batch: {obs_target_batch.shape if hasattr(obs_target_batch, 'shape') else type(obs_target_batch)}")
-        # print(f"  obs_batch_ori (original): {obs_batch_ori.shape if hasattr(obs_batch_ori, 'shape') else type(obs_batch_ori)}")
-        # print(f"{'='*80}\n")
-        # exit()
         
         # Apply augmentations if needed
         if self._cfg.use_augmentation:
