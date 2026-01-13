@@ -78,6 +78,21 @@ cartpole_unizero_config = dict(
         replay_buffer_size=int(1e6),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
+        # Whether to use pure policy (without MCTS) for data collection
+        collect_with_pure_policy=True,
+        # Whether to use pure policy (without MCTS) for evaluation
+        # If not set, will use collect_with_pure_policy value
+        eval_with_pure_policy=True,
+        # Whether to use online learning (clear replay_buffer after each training iteration)
+        online_learning=True,
+        # PPO configuration for GAE computation
+        ppo=dict(
+            gamma=0.99,           # Discount factor
+            gae_lambda=0.95,      # GAE lambda parameter
+            clip_ratio=0.2,       # PPO clipping ratio
+            value_coef=0.5,       # Value loss coefficient
+            entropy_coef=0.01,   # Entropy loss coefficient
+        ),
     ),
 )
 
