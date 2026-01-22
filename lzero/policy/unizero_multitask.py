@@ -144,15 +144,8 @@ class UniZeroMTPolicy(UniZeroPolicy):
     def __init__(self, cfg, model = None, enable_field = None):
         super().__init__(cfg, model, enable_field)
         self.step=0
-        self.save_freq=200
-        self.use_moe=False
+        self.save_freq=100
         
-        self.cal_profile=False
-        if self.cal_profile:
-            self.profiler=LineProfiler()
-            self.profiler.add_function(self._forward_learn)
-            self.profiler.enable_by_count()
-       
         
     # The default_config for UniZero policy.
     config = dict(
@@ -333,9 +326,11 @@ class UniZeroMTPolicy(UniZeroPolicy):
         n_episode=8,
         # (int) The number of num_segments in each collecting stage when use muzero_segment_collector.
         num_segments=8,
+
         # (int) the number of simulations in MCTS for collect.
         num_simulations=50,
         # (int) the number of simulations in MCTS for eval. If not set, use num_simulations.
+
         eval_num_simulations=50,
         # (float) Discount factor (gamma) for returns.
         discount_factor=0.997,
@@ -433,7 +428,7 @@ class UniZeroMTPolicy(UniZeroPolicy):
             device_type=self._cfg.device,
             betas=(0.9, 0.95),
         )
-        # self.a=1
+        
         if self._cfg.cos_lr_scheduler or self._cfg.piecewise_decay_lr_scheduler:
             from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 
@@ -789,7 +784,7 @@ class UniZeroMTPolicy(UniZeroPolicy):
         self._optimizer_world_model.zero_grad()
         
 
-        # ===================================modified by tangjia========================================
+        # ===================================#========================================
         
       
         self._learn_model.world_model.tokenizer.encoder[0].grad = None
@@ -818,7 +813,6 @@ class UniZeroMTPolicy(UniZeroPolicy):
             local_shared_expert_grad_list = []
             local_last_block_expert_grad_list = [[] for _ in range(num_experts)] 
             
-            print(f'Rank {rank} collecting gradients')
             gradient_conflict_log_dict = {}
 
             for i in range(local_task_num):
@@ -847,12 +841,10 @@ class UniZeroMTPolicy(UniZeroPolicy):
 
 
             
-            print(f'Rank {rank} computing gradient conflicts')
                 
             # Clear shared parameter gradients to avoid accumulation
             self._optimizer_world_model.zero_grad()
             
-            print(f'Rank {rank} computing attention gradient conflicts')
             # 1. Compute gradient conflicts after attention and before MOE
             local_before_moe_grad_list=torch.stack(local_before_moe_grad_list,dim=0) # shape: (local_task_num, encoder_grad_dim)
             before_moe_grad_conflict_ddp=compute_gradient_conflict_distributed(local_before_moe_grad_list, device=self._cfg.device)
@@ -865,7 +857,6 @@ class UniZeroMTPolicy(UniZeroPolicy):
             
             # cosine_similarity_matrix  self.logger
              
-            print(f'Rank {rank} computing encoder gradient conflicts')
             # 2. Compute gradient conflicts of encoder
             local_encoder_grad_list=torch.stack(local_encoder_grad_list,dim=0) # shape: (local_task_num, encoder_grad_dim)
             encoder_grad_conflict_ddp=compute_gradient_conflict_distributed(local_encoder_grad_list, device=self._cfg.device)
@@ -875,7 +866,6 @@ class UniZeroMTPolicy(UniZeroPolicy):
                 matrix_dict['encoder_grad_conflict_matrix']=encoder_grad_conflict_ddp.cosine_similarity_matrix 
 
 
-            print(f'Rank {rank} computing shared expert gradient conflicts')
             # 3. If shared expert exists, compute gradient conflicts on shared expert
             if self._learn_model.world_model.transformer.shared_expert>0 :
                 local_shared_expert_grad_list=torch.stack(local_shared_expert_grad_list,dim=0)
@@ -1020,6 +1010,8 @@ class UniZeroMTPolicy(UniZeroPolicy):
         if self.log_conflict_var:    
             # Log scalar values from gradient_conflict_log_dict to TensorBoard
             for key, value in gradient_conflict_log_dict.items():
+                print(f'正在记录梯度冲突分析 Rank {rank} Logging {key}: {value}')
+                
                 self.logger.add_scalar(f'gradient_conflict/{key}', value, self.step) 
             
         # print(f'Rank {rank} 正在根据冲突记录日志')
@@ -1090,6 +1082,12 @@ class UniZeroMTPolicy(UniZeroPolicy):
             }
             # 合并两个字典
             return_loss_dict.update(multi_task_loss_dicts)
+        # print(f'return_loss_dict:{return_loss_dict}')
+
+        self.step+=1
+        
+        
+        
         return return_loss_dict
 
     def monitor_weights_and_grads(self, model):
@@ -1108,10 +1106,15 @@ class UniZeroMTPolicy(UniZeroPolicy):
         """
         self._collect_model = self._model
 
+        # 为 collect MCTS 创建一个配置副本，并设置特定的模拟次数
+        mcts_collect_cfg = copy.deepcopy(self._cfg)
+        mcts_collect_cfg.num_simulations = self._cfg.collect_num_simulations
+
         if self._cfg.mcts_ctree:
-            self._mcts_collect = MCTSCtree(self._cfg)
+            self._mcts_collect = MCTSCtree(mcts_collect_cfg)
         else:
-            self._mcts_collect = MCTSPtree(self._cfg)
+            self._mcts_collect = MCTSPtree(mcts_collect_cfg)
+
         self._collect_mcts_temperature = 1.
         self._collect_epsilon = 0.0
         self.collector_env_num = self._cfg.collector_env_num
@@ -1143,13 +1146,7 @@ class UniZeroMTPolicy(UniZeroPolicy):
             'cur_lr_world_model',
             'weighted_total_loss',
             'total_grad_norm_before_clip_wm',
-            # modified by tangjia
-            'avg_encoder_grad_conflict',
-            'avg_before_moe_grad_conflict',
-            'avg_shared_expert_grad_conflict',
-
-        ]
-        
+        ]        
 
         # rank = get_rank()
         task_specific_vars = [
@@ -1374,6 +1371,7 @@ class UniZeroMTPolicy(UniZeroPolicy):
         """
         self._eval_model = self._model
         
+
         # 创建eval专用的配置对象，使用eval_num_simulations
         # eval_cfg = copy.deepcopy(self._cfg)
         # eval_num_simulations = getattr(self._cfg, 'eval_num_simulations', self._cfg.num_simulations)
@@ -1389,7 +1387,7 @@ class UniZeroMTPolicy(UniZeroPolicy):
             self._mcts_eval = MCTSCtree(self._cfg,eval=True)  # 使用eval专用配置
         else:
             self._mcts_eval = MCTSPtree(self._cfg)   # 使用eval专用配置
-        
+
         self.evaluator_env_num = self._cfg.evaluator_env_num
 
         if self._cfg.model.model_type == 'conv':
